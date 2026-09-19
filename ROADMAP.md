@@ -1402,17 +1402,69 @@ to its own results. The forward test is untouched.
 
 ## Next
 
-Ordered by expected value, highest first — except item 2, which is placed on
+Ordered by expected value, highest first — except item 3, which is placed on
 what it would teach rather than what it would earn.
 
-### 1. Move the run to a host that does not sleep
+### 1. Move the run to a host that does not sleep ✅
 
-The only item that shortens the wait. Phase 16 wrote the deploy artifacts; what
-remains is provisioning the host, copying the database and keys, and calling
-`POST /api/coverage/baseline` once at the moment of the move — not before. Until
-that happens every outage is worth ten days of gate progress.
+Done on 2026-09-19. The run lives on an Oracle Cloud Always Free
+`VM.Standard.E2.1.Micro` in `sa-saopaulo-1`, on Ubuntu 22.04, under the
+`pouch.service` unit Phase 16 wrote. The region is not a preference: Binance
+answers requests from US IP ranges with HTTP 451, which rules out Google's
+always-free `e2-micro` entirely, since it is free only in US regions.
 
-### 2. A first real-money phase: $20 a month, hold against sell-into-strength
+The database moved through SQLite's backup API rather than a file copy — the
+WAL held 5.8 MB that a plain `cp` would have dropped — and the host's own
+`trader.db-wal` and `-shm` had to be deleted before installing it, or a stale
+WAL would have been replayed against a different database. `POST
+/api/coverage/baseline` was called once, at the moment of the move: it set
+aside 83.1% over 142 closes, 24 of them missed, since 2026-08-30. A reboot was
+used to confirm the machine comes back on its own.
+
+Two defects in `deploy/install.sh` surfaced on first use, both fixed:
+`mkswap -q` (util-linux only grew `--quiet` in 2.38; 22.04 ships 2.37), and the
+`[[ ! -f /swapfile ]]` guard, which — because `fallocate` had already run before
+`mkswap` failed — would have skipped the whole block on the retry and left a
+2 GB swapfile that was never formatted or activated.
+
+### 2. Give the host enough memory to run all three books
+
+The micro shape has 956 MB usable, and three books plus the headline scorer do
+not fit in it. With the validated book, the exit study and FinBERT all resident,
+the machine thrashed: 22 MB/s paging back in, 44% iowait, and six ticks lost in
+35 minutes to `handshake operation timed out` and `read operation timed out`.
+The CPU was idle throughout — load average 0.08 — so this is a memory
+constraint and nothing else. A thread waiting on a page fault cannot finish a
+TLS handshake inside the client's 20-second timeout.
+
+Stopping the exit study ended it immediately: paging went to zero and stayed
+there. That is the current state — validated book running, exit study and lab
+stopped — and it is not a resting place, because item 3 depends on the exit
+study being allowed to report.
+
+`torch` is resident whether or not the lab runs: `bot/sentiment.py` loads
+FinBERT lazily on the first headline and caches the pipeline in a module global,
+so once the collector has scored anything, roughly 500 MB stays until the
+process dies. There is no configuration switch for it — `bot/feeds.py` calls the
+scorer unconditionally after every poll, guarded only by `try/except`.
+
+Three ways out, none chosen yet:
+
+- **An Ampere A1 shape.** Always Free allows up to 4 OCPU and 24 GB, which ends
+  the question rather than trading one thing off against another. The risk is
+  stock in `sa-saopaulo-1`, which is frequently exhausted; the migration itself
+  is the one already rehearsed above.
+- **Drop `torch` and `transformers`.** Frees the ~500 MB immediately and lets
+  the exit study back on. Headlines keep being collected; `sentiment` goes NULL
+  from that day forward. A column scored for one stretch and not the next is
+  exactly the discontinuity `sentiment_model` exists to make visible, so this
+  costs the feature for the ranking model, not just a nice-to-have.
+- **Raise the HTTP timeout and retry once** on transport errors in
+  `bot/exchange.py`. Worth doing under any of the above rather than instead of
+  them: today a single timeout costs a whole tick, and a remote host will lose
+  packets whatever its memory looks like.
+
+### 3. A first real-money phase: $20 a month, hold against sell-into-strength
 
 Two strategies on Bitcoin, funded by a $20 monthly deposit. One buys and never
 sells. The other buys and sells as soon as the position is up. Small in money
@@ -1420,17 +1472,18 @@ and large in what it teaches: it is the only item on this list that tests
 custody, funding, real fills and real fees, none of which the Spot Testnet can
 be made to charge.
 
-It is also the same question the Phase 18 exit study is measuring right now, on
-paper, on the validated book's own trades. That study is the dry run for this
-phase and should be allowed to report before it starts — if holding beats
-selling into strength on the paired trades, the second strategy is answered
-before a cent is spent.
+It is also the same question the Phase 18 exit study measures, on paper, on the
+validated book's own trades. That study is the dry run for this phase and
+should be allowed to report before it starts — if holding beats selling into
+strength on the paired trades, the second strategy is answered before a cent is
+spent.
 
 What has to be built or decided first, in order:
 
-1. **An always-on host.** Item 1 above is a hard prerequisite, not a
-   preference. A strategy that sells on strength cannot miss candle closes, and
-   coverage on this deployment has been measured at 15.4%.
+1. **An always-on host.** Item 1 is done, so what remains of this prerequisite
+   is item 2: the exit study cannot report from a machine that has to keep it
+   stopped to stay responsive, and a strategy that sells on strength cannot
+   miss candle closes.
 2. **Two strategies on one spot balance.** The decision log says one allocation
    per symbol, for a concrete reason: on a spot account both strategies own the
    same BTC, so the seller can sell the holder's coins. Nothing in the ledger
@@ -1467,7 +1520,7 @@ Two things worth writing down before the temptation arrives:
   committed in `python/phase_4.py` are testnet-only and are still in git
   history; they must be revoked regardless of this phase.
 
-### 3. Act on the regime split
+### 4. Act on the regime split
 
 Phase 16 measured that the book loses to holding in fourteen bull windows out of
 fifteen and beats it in every bear window. Two things follow, and neither is
@@ -1477,7 +1530,7 @@ beating a long benchmark with a long-only book in a rally is not the thing this
 book is for. Both need the forward test to finish first — changing what gets
 traded now would end the test of what was measured.
 
-### 4. Promote or bury the ranking model
+### 5. Promote or bury the ranking model
 
 Phase 18 built it as a separate book on purpose: it is an experiment, and an
 experiment that shares a ledger with a frozen forward test contaminates it. That
@@ -1494,7 +1547,7 @@ and positioning are already wired into the panel and gated at 30% coverage, so
 they arrive when there is enough history to walk them forward, around a year
 from the start of collection, and not before.
 
-### 5. Short and market-neutral
+### 6. Short and market-neutral
 
 Everything so far is spot-long-only, which means every strategy is structurally
 long crypto beta. That is why beating buy-and-hold is so hard: the benchmark is
