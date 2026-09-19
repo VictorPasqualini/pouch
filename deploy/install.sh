@@ -31,10 +31,11 @@ echo "==> swap"
 # book briefly needs more than that, and an out-of-memory kill in the middle of
 # a poll is a missed candle close, which is the one thing the coverage gate
 # counts against you. Swap turns that failure into a slow minute instead.
-if [[ ! -f /swapfile ]]; then
-    fallocate -l 2G /swapfile
+if ! swapon --show=NAME --noheadings 2>/dev/null | grep -qx /swapfile; then
+    [[ -f /swapfile ]] || fallocate -l 2G /swapfile
     chmod 600 /swapfile
-    mkswap -q /swapfile
+    # No -q: util-linux only grew --quiet in 2.38, and 22.04 ships 2.37.
+    mkswap /swapfile >/dev/null
     swapon /swapfile
     grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
