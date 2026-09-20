@@ -981,3 +981,15 @@ input:hover:not(:focus), select:hover:not(:focus) { border-color: var(--surface-
 }
 .gatebar-trust.is-bad { color: var(--neg); background: var(--neg-soft); }
 .gatebar-trust.is-ok { color: var(--pos); background: var(--pos-soft); }
+
+/* Um formulário com edição pendente para de receber valores do servidor, e
+   precisa dizer isso: sem o aviso, os campos simplesmente "param de atualizar"
+   e ninguém sabe por quê. */
+.form-grid.is-dirty { position: relative; }
+.form-grid.is-dirty::before {
+  content: "alterações não salvas";
+  position: absolute; top: -20px; right: 0;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--warn);
+}
+.form-grid.is-dirty .btn-primary { box-shadow: 0 0 0 3px rgba(247, 185, 85, 0.22); }
