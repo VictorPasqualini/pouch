@@ -33,6 +33,8 @@ not choose it.
 from __future__ import annotations
 
 import math
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -213,6 +215,219 @@ def correlation_block(symbol: str, interval: str, open_symbols: list[str],
             return {"blocked_by": other, "correlation": round(value, 3),
                     "limit": limit}
     return None
+
+
+# ------------------------------------------------- concentração do livro
+
+STRUCTURAL_BARS = 365
+BOOK_TTL = 900.0
+_book_cache: dict[str, Any] = {}
+_book_lock = threading.Lock()
+
+
+def effective_bets(count: int, avg_correlation: float) -> float:
+    """Quantas apostas independentes um livro de ``count`` nomes carrega.
+
+    Para ``n`` posições de mesmo tamanho e mesma volatilidade, com correlação
+    média ``r`` entre elas, a variância da carteira é ``s²·[1 + (n-1)·r] / n``.
+    Uma carteira de ``k`` posições independentes teria variância ``s²/k``.
+    Igualando as duas, ``k = n / [1 + (n-1)·r]``.
+
+    É o número que responde "quantas apostas eu tenho, de verdade": dezessete
+    nomes com correlação média 0,67 reduzem risco como 1,5 posições
+    independentes reduziriam. A diversificação é nominal.
+
+    A fórmula assume tamanhos e volatilidades iguais, o que quase nunca é
+    verdade — por isso ``volatility`` vem ao lado, dizendo o quanto essa
+    premissa está sendo violada. Como aproximação de ordem de grandeza ela é
+    sólida, e a ordem de grandeza é o que decide se vale ligar o teto de
+    correlação.
+    """
+    if count <= 1:
+        return float(count)
+    denominator = 1 + (count - 1) * max(0.0, avg_correlation)
+    return count / denominator if denominator > 0 else float(count)
+
+
+def _book_returns(symbols: list[str], interval: str,
+                  bars: int) -> dict[str, np.ndarray]:
+    """Uma busca de histórico por moeda, não uma por par.
+
+    São 136 pares entre dezessete nomes. Chamar ``correlation`` para cada um
+    faria 272 buscas para ler dezessete séries.
+    """
+    series: dict[str, np.ndarray] = {}
+    for symbol in symbols:
+        try:
+            values = _returns(symbol, interval, bars)
+        except Exception:
+            continue
+        if len(values) >= 30:
+            series[symbol] = values
+        # a moeda sem histórico suficiente some daqui e some das contas
+    return series
+
+
+def _concentration(symbols: list[str], interval: str, bars: int) -> dict[str, Any]:
+    """Correlação entre todos os pares do livro, num horizonte."""
+    series = _book_returns(symbols, interval, bars)
+    names = sorted(series)
+
+    pairs: list[dict[str, Any]] = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            size = min(len(series[a]), len(series[b]))
+            value = float(np.corrcoef(series[a][-size:], series[b][-size:])[0, 1])
+            if math.isfinite(value):
+                pairs.append({"a": a, "b": b, "value": round(value, 3)})
+
+    values = sorted(pair["value"] for pair in pairs)
+    average = sum(values) / len(values) if values else 0.0
+    step_ms = INTERVAL_MS.get(interval) or 86_400_000
+
+    return {
+        "interval": interval,
+        "bars": bars,
+        "window_days": round(bars * step_ms / 86_400_000),
+        "measured": len(names),
+        "skipped": sorted(set(symbols) - set(names)),
+        "avg_correlation": round(average, 3),
+        "median_correlation": round(values[len(values) // 2], 3) if values else None,
+        "effective_bets": round(effective_bets(len(names), average), 1),
+        "pairs": len(pairs),
+        "pairs_above_70": sum(1 for v in values if v > 0.70),
+        "pairs_above_80": sum(1 for v in values if v > 0.80),
+        "highest": max(pairs, key=lambda p: p["value"]) if pairs else None,
+        "lowest": min(pairs, key=lambda p: p["value"]) if pairs else None,
+        "per_symbol": {
+            symbol: round(
+                sum(p["value"] for p in pairs if symbol in (p["a"], p["b"]))
+                / max(1, sum(1 for p in pairs if symbol in (p["a"], p["b"]))), 3)
+            for symbol in names
+        },
+    }
+
+
+def exposure_history(config: dict[str, Any]) -> dict[str, Any]:
+    """Quanto do livro esteve realmente dentro, medido no que aconteceu.
+
+    Sai de ``equity_snapshots``, não de simulação: é a exposição que este robô
+    teve, não a que uma estratégia teria tido. Sem histórico não há resposta, e
+    dizer isso é melhor do que devolver zero com cara de medição.
+    """
+    rows = storage.query(
+        "SELECT open_positions, positions_value, total_value "
+        "FROM equity_snapshots ORDER BY ts")
+    cap = int(config.get("max_positions", 3) or 0)
+    quote = float(config.get("quote_per_trade", 0.0) or 0.0)
+    ceiling = round(cap * quote, 2) if cap and quote else None
+    if not rows:
+        return {"samples": 0, "cap": cap, "ceiling": ceiling}
+
+    counts = [int(row["open_positions"] or 0) for row in rows]
+    committed = [float(row["positions_value"] or 0.0) for row in rows]
+    totals = [float(row["total_value"] or 0.0) for row in rows]
+    deployed = [c / t * 100 for c, t in zip(committed, totals) if t > 0]
+
+    return {
+        "samples": len(rows),
+        "cap": cap,
+        "ceiling": ceiling,
+        "avg_open": round(sum(counts) / len(counts), 2),
+        "max_open": max(counts),
+        "flat_pct": round(sum(1 for c in counts if c == 0) / len(counts) * 100, 1),
+        "at_cap_pct": round(
+            sum(1 for c in counts if cap and c >= cap) / len(counts) * 100, 1),
+        "avg_committed": round(sum(committed) / len(committed), 2),
+        "max_committed": round(max(committed), 2),
+        "avg_deployed_pct": round(sum(deployed) / len(deployed), 1) if deployed else None,
+    }
+
+
+def book_view(config: dict[str, Any], force: bool = False) -> dict[str, Any]:
+    """O livro visto como carteira, e não como uma lista de alocações.
+
+    A varredura pergunta "esta regra presta nesta moeda?" uma vez por moeda, de
+    forma independente. Ninguém nunca pergunta se as dezessete juntas formam
+    uma carteira — e é essa a pergunta que decide se vale ligar o teto de
+    correlação e o dimensionamento por volatilidade.
+
+    Dois horizontes, porque eles discordam e a discordância é informação:
+
+    ``near``
+        A janela que os próprios controles usam - noventa velas do tempo
+        gráfico do livro. É o que ``correlation_block`` vai enxergar na hora de
+        recusar uma entrada, então é o número que prevê o comportamento.
+
+    ``structural``
+        Um ano de velas diárias. É a fotografia de fundo, e ela costuma ser
+        pior: em quinze dias duas moedas conseguem divergir, em um ano de
+        altcoins contra dólar elas quase nunca divergem.
+
+    Decidir pelo primeiro sozinho subestima o risco; pelo segundo sozinho,
+    prevê errado o que o teto vai fazer.
+
+    Cacheado por quinze minutos: são trinta e quatro buscas de histórico, e
+    nada disso muda dentro de um ciclo de tela.
+    """
+    allocations = config.get("allocations") or []
+    symbols = sorted({a["symbol"] for a in allocations if a.get("symbol")})
+    # Um livro pode misturar tempos gráficos, e correlação entre séries de
+    # relógios diferentes não significa nada sem reamostrar. O dominante decide,
+    # e a tela diz qual foi.
+    intervals = [a.get("interval", "1h") for a in allocations]
+    interval = max(set(intervals), key=intervals.count) if intervals else "1h"
+
+    if not symbols:
+        return {"count": 0, "measured": 0, "interval": interval,
+                "exposure": exposure_history(config),
+                "settings": settings_for(config), "cached": False}
+
+    key = f"{interval}:{','.join(symbols)}"
+    now = time.time()
+    with _book_lock:
+        hit = _book_cache.get(key)
+        if hit and not force and now - hit["computed_at_ts"] < BOOK_TTL:
+            return {**hit, "exposure": exposure_history(config), "cached": True}
+
+    near = _concentration(symbols, interval, CORRELATION_BARS)
+    structural = _concentration(symbols, "1d", STRUCTURAL_BARS)
+
+    volatility: list[dict[str, Any]] = []
+    for symbol in sorted(set(near["per_symbol"]) | set(structural["per_symbol"])):
+        try:
+            daily = realised_volatility(symbol, interval)
+        except Exception:
+            continue
+        volatility.append({
+            "symbol": symbol,
+            "volatility_pct": round(daily * 100, 2),
+            # O que o dimensionamento por volatilidade faria com esta moeda, se
+            # estivesse ligado. Mostrar o fator é o que transforma a opção num
+            # número em vez de numa promessa.
+            "size_factor": round(
+                max(SIZE_FLOOR, min(SIZE_CEILING, REFERENCE_VOL / daily)), 2),
+            "near_correlation": near["per_symbol"].get(symbol),
+            "structural_correlation": structural["per_symbol"].get(symbol),
+        })
+    volatility.sort(key=lambda row: -row["volatility_pct"])
+
+    vols = [row["volatility_pct"] for row in volatility]
+    result = {
+        "count": len(allocations),
+        "interval": interval,
+        "near": near,
+        "structural": structural,
+        "volatility": volatility,
+        "vol_spread": round(max(vols) / min(vols), 2) if vols and min(vols) > 0 else None,
+        "vol_bars": VOL_BARS,
+        "settings": settings_for(config),
+        "computed_at": storage.now(),
+        "computed_at_ts": now,
+    }
+    with _book_lock:
+        _book_cache[key] = result
+    return {**result, "exposure": exposure_history(config), "cached": False}
 
 
 # ------------------------------------------------------------------ summary

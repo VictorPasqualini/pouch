@@ -89,6 +89,56 @@ cada uma. Uma linha por alocação, com botão de remover.
 pelo mesmo saldo — na conta spot, as duas são donas do mesmo BTC, e a que vende
 pode vender as moedas da que segura.
 
+**Remover não é o oposto de adicionar.** O ciclo do robô só percorre a lista de
+alocações: uma moeda removida enquanto segura posição nunca mais é avaliada,
+nenhuma regra de saída roda, e nada vai vendê-la. Ela ficaria marcada a mercado
+no seu patrimônio para sempre.
+
+Por isso, remover uma alocação com posição aberta **pergunta antes** e oferece
+encerrar a posição junto. Se a venda falhar, nada é removido — meio caminho
+seria a pior saída possível.
+
+Se alguma posição já estiver nesse estado, ela aparece **em vermelho** no topo
+deste card, dizendo que ninguém a avalia, com um botão para encerrá-la.
+
+### A carteira como um todo
+
+A busca pergunta *"esta regra presta nesta moeda?"* uma vez por moeda, de forma
+independente. Ninguém nunca pergunta se as moedas **juntas** formam uma carteira.
+Este card faz essa pergunta.
+
+**Apostas efetivas** é o número que importa. Para `n` posições de mesmo tamanho
+com correlação média `r` entre elas, a variância da carteira equivale à de
+`n / [1 + (n−1)·r]` posições independentes. Dezessete nomes com correlação média
+0,67 reduzem risco como **1,5** posições independentes reduziriam.
+
+Isso não é opinião: é a mesma matemática que diz que dezessete cópias do mesmo
+bilhete de loteria não são dezessete chances.
+
+**Dois horizontes, e eles discordam** — a discordância é a informação:
+
+| horizonte | o que é | para que serve |
+|---|---|---|
+| **15 dias**, velas do seu tempo gráfico | a janela que o teto de correlação realmente usa | prevê **quantas entradas o teto vai recusar** se você ligar |
+| **365 dias**, velas diárias | a estrutura de fundo | é a verdade, e quase sempre a pior das duas |
+
+Em duas semanas, duas moedas conseguem divergir. Em um ano de altcoin contra
+dólar, quase nunca divergem. Decidir só pelo curto subestima o risco; só pelo
+longo, prevê errado o que o teto vai fazer.
+
+**Dispersão de risco** compara a moeda mais agitada com a menos agitada. Se dá
+4,7x, então o mesmo valor em cada uma **não é o mesmo risco** em cada uma — e a
+coluna *Tamanho se ligado* mostra exatamente o que o dimensionamento por
+volatilidade faria com cada moeda, antes de você ligá-lo.
+
+**Exposição média** sai do histórico real do robô, não de simulação: quantas
+posições ficaram abertas ao mesmo tempo, em média, e quanto do capital ficou
+parado. Começa vazio e enche sozinho.
+
+> O cálculo lê o histórico de dezessete moedas e leva uns vinte segundos. Por
+> isso ele fica guardado por quinze minutos e **não** roda no ciclo de
+> atualização — o resto da aba nunca espera por ele. `Recalcular` força.
+
 ### Risco da carteira
 
 Todos vêm **desligados**, e isso é uma decisão medida, não preguiça: stop por
@@ -192,8 +242,27 @@ O selo diz o veredito:
 - **`reprovada`** — não passou
 
 A caixa **só aprovadas fora da amostra** filtra o resto. Clique numa linha para
-ver a curva contra o benchmark. Marque e clique em **Operar selecionadas** para
+ver a curva contra o benchmark. Marque e clique em **Adicionar ao livro** para
 promover ao livro ao vivo.
+
+O botão **soma**: marcar três e clicar não apaga as que já operam. O aviso conta
+o que mudou — quantas entraram, quantas foram trocadas, e com quantas o livro
+ficou.
+
+Duas coisas que surpreendem:
+
+- **Nenhuma ordem é enviada no clique.** O botão só escreve configuração. Quem
+  decide comprar é o próximo ciclo.
+- **A alocação nova provavelmente não compra de cara.** Se o sinal já estiver
+  comprado quando ela entra, o robô fica de fora e espera o sinal cair e virar
+  para cima de novo. É deliberado: a estratégia segura a posição entre o pulso
+  de entrada e o de saída, e entrar no meio seria comprar um movimento que
+  começou dias atrás — uma operação que nenhum backtest fez. Uma vela de atraso
+  já custa 0,8 ponto de retorno médio; cinco custam 2,6 pontos.
+
+Se uma das marcadas for de uma moeda que já opera **e tem posição aberta**,
+trocar a estratégia faria a saída seguir uma regra diferente da que abriu a
+posição. A tela pergunta antes.
 
 > Um ranking é uma lista de sobreviventes, e sobreviventes de uma busca grande
 > são em parte sobreviventes de sorte. Trate `aprovada` como *evidência que

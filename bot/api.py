@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -76,6 +76,19 @@ class AllocationRequest(BaseModel):
     result_ids: list[int] | None = None
     allocations: list[dict[str, Any]] | None = None
     quote_per_trade: float | None = None
+    # O que uma escrita significa. "merge" soma ao livro que já está no ar;
+    # "replace" declara o livro inteiro e derruba o que faltar nele. A direção
+    # inofensiva é o padrão de propósito — a que pode perder dezesseis
+    # alocações tem de ser pedida pelo nome.
+    mode: Literal["merge", "replace"] = "merge"
+    # Os dois guardas abaixo recusam em vez de surpreender. `force` aceita a
+    # consequência; `close_dropped` remove a consequência, vendendo antes.
+    force: bool = False
+    close_dropped: bool = False
+
+
+class CloseRequest(BaseModel):
+    symbols: list[str] | None = None
 
 
 class RiskRequest(BaseModel):
@@ -146,6 +159,21 @@ def risk() -> dict[str, Any]:
     config = get_config()
     symbols = sorted({p["symbol"] for p in bot.open_positions()})
     return portfolio.state(config, symbols)
+
+
+@app.get("/api/portfolio/book")
+def portfolio_book(force: bool = False) -> dict[str, Any]:
+    """O livro visto como carteira: quantas apostas ele carrega de verdade.
+
+    Dezessete alocações são dezessete perguntas respondidas uma de cada vez.
+    Esta é a pergunta que nunca foi feita — se as dezessete juntas prestam como
+    carteira — e é ela que decide se vale ligar o teto de correlação e o
+    dimensionamento por volatilidade.
+
+    Caro o suficiente (uma busca de histórico por moeda) para ser cacheado por
+    quinze minutos; `force` recalcula.
+    """
+    return portfolio.book_view(get_config(), force=force)
 
 
 @app.post("/api/risk")
@@ -427,14 +455,69 @@ def update_config(request: ConfigRequest) -> dict[str, Any]:
     return save_config(patch)
 
 
+ALLOCATION_KEYS = ("symbol", "interval", "strategy", "params", "risk")
+
+
+def _same_allocation(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Mesmo instrumento, mesma regra, mesmos parâmetros, mesmo risco."""
+    return all(a.get(key) == b.get(key) for key in ALLOCATION_KEYS)
+
+
+@app.get("/api/bot/allocations")
+def get_allocations() -> dict[str, Any]:
+    """O livro no ar, e o que está segurando moeda debaixo dele.
+
+    `orphans` são posições abertas cujo símbolo não está mais alocado. O ciclo
+    não consegue vê-las, então nada nunca vai vendê-las; são relatadas aqui
+    para a tela poder dizer isso, em vez de o número ficar calado no total do
+    patrimônio para sempre.
+    """
+    allocations = list(get_config().get("allocations") or [])
+    allocated = {allocation["symbol"] for allocation in allocations}
+    orphans = [
+        {
+            "symbol": position["symbol"],
+            "strategy": position["strategy"],
+            "entry_quote": position["entry_quote"],
+            "entry_time": position["entry_time"],
+        }
+        for position in bot.open_positions()
+        if position["symbol"] not in allocated
+    ]
+    return {"allocations": allocations, "orphans": orphans}
+
+
 @app.post("/api/bot/allocations")
 def set_allocations(request: AllocationRequest) -> dict[str, Any]:
-    allocations: list[dict[str, Any]] = list(request.allocations or [])
+    """Escreve o livro que opera.
+
+    Duas coisas aqui custam dinheiro de verdade quando ficam implícitas, e
+    nenhuma das duas fica mais.
+
+    A primeira é o que uma escrita significa. Isto montava a lista só a partir
+    do pedido, o que fazia de toda escrita uma substituição: marcar três linhas
+    no ranking e clicar trocava um livro de dezessete por três, e a confirmação
+    dizia "3 estratégia(s) prontas para operar" — verdade, e sem nenhuma pista
+    de que catorze tinham acabado de sumir. Agora quem decide é `mode`, e o
+    padrão dele é a direção que não perde nada.
+
+    A segunda é o que acontece com uma posição cuja estratégia foi retirada. O
+    ciclo só percorre `config["allocations"]`, então um símbolo removido
+    enquanto segura moeda nunca mais é avaliado: nenhuma regra de saída roda,
+    nada o vende, e ele fica marcado a mercado no patrimônio para sempre. Isso
+    é recusado aqui, com a opção de vender na mesma chamada, em vez de ser
+    descoberto meses depois.
+    """
+    incoming: list[dict[str, Any]] = []
+    for allocation in request.allocations or []:
+        if not allocation.get("symbol"):
+            raise HTTPException(400, "every allocation needs a symbol")
+        incoming.append(allocation)
     for result_id in request.result_ids or []:
         result = research.result_by_id(result_id)
         if not result:
             raise HTTPException(404, f"result {result_id} not found")
-        allocations.append({
+        incoming.append({
             "symbol": result["symbol"],
             "interval": result["interval"],
             "strategy": result["strategy"],
@@ -443,17 +526,59 @@ def set_allocations(request: AllocationRequest) -> dict[str, Any]:
             "risk": result["risk"],
             "source_result_id": result_id,
         })
+
+    before = {a["symbol"]: a for a in (get_config().get("allocations") or [])}
     # One live allocation per symbol: two strategies on the same asset would
-    # fight over the same spot balance.
-    unique: dict[str, dict[str, Any]] = {}
-    for allocation in allocations:
-        unique.setdefault(allocation["symbol"], allocation)
-    patch: dict[str, Any] = {"allocations": list(unique.values())}
+    # fight over the same spot balance. Keying the book by symbol is what
+    # enforces it, in both modes.
+    book: dict[str, dict[str, Any]] = dict(before) if request.mode == "merge" else {}
+    for allocation in incoming:
+        # Uma escolha explícita ganha do que estava lá. Manter a antiga faria um
+        # clique deliberado não fazer absolutamente nada.
+        book[allocation["symbol"]] = allocation
+
+    added = sorted(symbol for symbol in book if symbol not in before)
+    swapped = sorted(
+        symbol for symbol in book
+        if symbol in before and not _same_allocation(before[symbol], book[symbol])
+    )
+    dropped = sorted(symbol for symbol in before if symbol not in book)
+
+    # Só as posições que ESTA escrita abandonaria. Um símbolo já órfão de uma
+    # escrita anterior é relatado pelo GET, não usado para travar outra coisa.
+    held = {position["symbol"] for position in bot.open_positions()}
+    stranded = [symbol for symbol in dropped if symbol in held]
+    rewritten = [symbol for symbol in swapped if symbol in held]
+
+    if stranded and not (request.close_dropped or request.force):
+        raise HTTPException(409, {
+            "code": "would_strand",
+            "symbols": stranded,
+            "message": (
+                f"{', '.join(stranded)} tem posição aberta. Remover a estratégia "
+                "deixa a posição sem ninguém para vendê-la."),
+        })
+    if rewritten and not request.force:
+        raise HTTPException(409, {
+            "code": "would_rewrite",
+            "symbols": rewritten,
+            "message": (
+                f"{', '.join(rewritten)} tem posição aberta sob outra estratégia. "
+                "Trocar agora faz a saída seguir uma regra diferente da que abriu."),
+        })
+    if stranded and request.close_dropped:
+        bot.close_all("allocation removed", symbols=stranded)
+
+    patch: dict[str, Any] = {"allocations": list(book.values())}
     if request.quote_per_trade:
         patch["quote_per_trade"] = request.quote_per_trade
     config = save_config(patch)
-    storage.log_event("info", f"Allocations set: {len(config['allocations'])} strategies")
-    return config
+    storage.log_event(
+        "info",
+        f"Allocations {request.mode}: {len(config['allocations'])} strategies"
+        f" (+{len(added)} ~{len(swapped)} -{len(dropped)})",
+    )
+    return {**config, "changes": {"added": added, "swapped": swapped, "dropped": dropped}}
 
 
 @app.post("/api/bot/start")
@@ -472,8 +597,10 @@ def bot_tick() -> dict[str, Any]:
 
 
 @app.post("/api/bot/close-all")
-def bot_close_all() -> dict[str, Any]:
-    return {"closed": bot.close_all("manual")}
+def bot_close_all(request: CloseRequest | None = None) -> dict[str, Any]:
+    """Vende tudo, ou só os símbolos nomeados. Sem corpo significa tudo."""
+    symbols = request.symbols if request else None
+    return {"closed": bot.close_all("manual", symbols=symbols)}
 
 
 @app.post("/api/bot/reset")

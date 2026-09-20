@@ -177,6 +177,23 @@
         <p class="empty" id="panel-trades-empty" hidden>Nenhuma operação registrada.</p>
       </div>
 
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Histórico de avisos</h2>
+          <div class="panel-actions">
+            <span class="muted" id="logbook-count">—</span>
+            <button class="btn btn-small btn-ghost" id="btn-log-clear">Limpar</button>
+          </div>
+        </div>
+        <p class="hint">Cada aviso que piscou no canto da tela fica guardado
+          aqui. Eles somem em quatro segundos, e às vezes são a única notícia de
+          que um ciclo falhou. Ficam no seu navegador, não no servidor — então
+          incluem os erros que o servidor nunca chegou a ver, como uma queda de
+          rede. A caixa rola por dentro e guarda os 200 últimos.</p>
+        <div class="scrollbox" id="logbook"></div>
+        <p class="empty" id="logbook-empty" hidden>Nada registrado neste navegador ainda.</p>
+      </div>
+
     </section>
 
     <!-- --------------------------------------------------------------- LAB -->
@@ -257,6 +274,21 @@
         <p class="empty" id="allocations-empty">
           Nenhuma. Rode uma varredura abaixo e promova as aprovadas.
         </p>
+      </div>
+
+      <div class="panel" id="panel-book">
+        <div class="panel-head">
+          <h2>A carteira como um todo</h2>
+          <div class="panel-actions">
+            <span class="muted" id="book-stamp">—</span>
+            <button class="btn btn-small btn-ghost" id="btn-book-refresh">Recalcular</button>
+          </div>
+        </div>
+        <p class="hint">A busca pergunta <em>“esta regra presta nesta moeda?”</em>
+          uma vez por moeda, de forma independente. Ninguém pergunta se as moedas
+          juntas formam uma carteira — e é essa pergunta que decide se vale ligar
+          os controles logo abaixo.</p>
+        <div id="book-body"></div>
       </div>
 
       <div class="panel">
@@ -397,7 +429,10 @@
               <input type="checkbox" id="chk-validated" checked>
               <span>só aprovadas fora da amostra</span>
             </label>
-            <button class="btn btn-small btn-primary" id="btn-allocate">Operar selecionadas</button>
+            <button class="btn btn-small btn-primary" id="btn-allocate"
+                    title="Soma as marcadas ao livro que já está operando, sem apagar as atuais">
+              Adicionar ao livro
+            </button>
           </div>
         </div>
         <div class="table-wrap">

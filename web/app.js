@@ -18,6 +18,8 @@ const state = {
   processes: [],
   monthlyYear: null,
   monthlyData: null,
+  book: null,
+  bookLoading: false,
 };
 
 const VIEW_META = {
@@ -40,7 +42,18 @@ async function api(path, options = {}) {
   });
   const text = await response.text();
   const data = text ? JSON.parse(text) : null;
-  if (!response.ok) throw new Error(data?.detail || response.statusText);
+  if (!response.ok) {
+    /* `detail` e uma frase na maioria dos erros, e um objeto nos poucos que a
+       tela precisa tratar de um jeito proprio - "essa moeda tem posicao
+       aberta" pede uma pergunta, nao um toast vermelho. Concatenar um objeto
+       numa string produz "[object Object]", entao ele viaja ao lado da
+       mensagem em vez de virar ela. */
+    const detail = data?.detail;
+    const error = new Error(
+      typeof detail === 'string' ? detail : (detail?.message || response.statusText));
+    if (detail && typeof detail === 'object') error.detail = detail;
+    throw error;
+  }
   return data;
 }
 
@@ -67,6 +80,68 @@ function toast(message, kind = '') {
   el.hidden = false;
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => { el.hidden = true; }, 3800);
+  logLine(message, kind);
+}
+
+/* ------------------------------------------------------ historico de avisos */
+
+/* Um toast vive 3,8 segundos e some. Boa parte do que ele diz e a unica
+   noticia de que algo falhou: um ciclo que nao conseguiu falar com a corretora,
+   uma ordem recusada, uma configuracao que nao salvou. Quem estava olhando para
+   outra aba nunca soube.
+
+   Entao cada um deles tambem cai aqui. Fica no navegador, nao no servidor - sao
+   avisos da interface, incluindo os que o servidor nunca chegou a ver, como um
+   erro de rede. Repeticoes viram contagem em vez de linha nova, senao um ciclo
+   quebrado a cada quinze segundos enterra todo o resto em uma hora. */
+const LOG_LIMIT = 200;
+const LOG_KEY = 'pouch.logbook';
+
+const logbook = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LOG_KEY) || '[]');
+    return Array.isArray(saved) ? saved.slice(0, LOG_LIMIT) : [];
+  } catch (error) {
+    return [];  /* aba anonima, cota cheia: a sessao atual ainda registra */
+  }
+})();
+
+function logLine(message, kind) {
+  const head = logbook[0];
+  if (head && head.message === message && head.kind === (kind || 'info')) {
+    head.count = (head.count || 1) + 1;
+    head.at = Date.now();
+  } else {
+    logbook.unshift({ at: Date.now(), message, kind: kind || 'info', count: 1 });
+    if (logbook.length > LOG_LIMIT) logbook.length = LOG_LIMIT;
+  }
+  try { localStorage.setItem(LOG_KEY, JSON.stringify(logbook)); } catch (error) { /* idem */ }
+  renderLog();
+}
+
+/* Hora absoluta, nao "ha 2 minutos": um rotulo relativo mudaria de texto a cada
+   ciclo e faria a caixa inteira ser reescrita sem nenhuma noticia nova. */
+function logTime(ms) {
+  const when = new Date(ms);
+  const clock = when.toLocaleTimeString('pt-BR',
+    { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  if (when.toDateString() === new Date().toDateString()) return clock;
+  return `${when.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })} ${clock}`;
+}
+
+function renderLog() {
+  const box = $('#logbook');
+  if (!box) return;
+  const empty = $('#logbook-empty');
+  if (empty) empty.hidden = logbook.length > 0;
+  setText('#logbook-count', logbook.length
+    ? `${logbook.length} ${logbook.length === 1 ? 'aviso' : 'avisos'}` : '—');
+  setHTML(box, logbook.map((row) => `
+    <div class="logrow ${row.kind === 'error' ? 'is-error' : row.kind === 'ok' ? 'is-ok' : ''}">
+      <span class="logrow-time">${logTime(row.at)}</span>
+      <span class="logrow-msg">${esc(row.message)}</span>
+      ${row.count > 1 ? `<span class="logrow-count">${row.count}x</span>` : ''}
+    </div>`).join(''));
 }
 
 function setText(id, value, className) {
@@ -569,15 +644,21 @@ async function loadLab() {
   ]);
   renderResearchProgress(status);
   renderSweepState(status, runs);
-  const [feeds, procs, catalog, config, risk] = await Promise.all([
+  /* O livro vem do seu próprio endpoint, não de `config`, porque ele responde
+     uma pergunta que a configuração sozinha não responde: quais posições estão
+     abertas sem ninguém para vendê-las. */
+  const [feeds, procs, catalog, config, risk, book] = await Promise.all([
     api('/feeds'), api('/processes'), api('/strategies'),
-    api('/bot/config'), api('/risk'),
+    api('/bot/config'), api('/risk'), api('/bot/allocations'),
   ]);
   renderFeeds(feeds);
   renderProcesses(procs);
   renderBot(procs, config);
   renderRisk(risk);
-  renderAllocations(config);
+  renderAllocations(book);
+  /* Sem await de propósito: ver acima, em loadBook. */
+  renderBook(state.book);
+  if (!state.book && !state.bookLoading) loadBook();
   /* Last on the page, and deliberately: it is reference material about what
      exists to be chosen, not a control. Someone reaches for it once, when a
      name in the ranking above means nothing to them. */
@@ -1174,26 +1255,214 @@ function renderBot(data, config) {
   });
 }
 
-function renderAllocations(config) {
-  const list = config.allocations || [];
-  $('#allocations-empty').hidden = list.length > 0;
+function renderAllocations(book) {
+  const list = book.allocations || [];
+  const orphans = book.orphans || [];
+  $('#allocations-empty').hidden = list.length > 0 || orphans.length > 0;
   setText('#allocations-count', list.length
     ? `${list.length} ${list.length === 1 ? 'estratégia' : 'estratégias'}` : '—');
-  const wrote = setHTML('#allocations-list', list.map((a, index) => `
+
+  const rows = list.map((a, index) => `
     <div class="alloc">
       <div class="alloc-main">
         <strong>${a.symbol} · ${a.label || a.strategy}</strong>
         <span>${a.interval} · ${paramText(a.params || {})} · ${riskText(a.risk || {})}</span>
       </div>
       <button class="btn btn-small btn-danger" data-drop="${index}">Remover</button>
-    </div>`).join(''));
+    </div>`);
 
-  if (wrote) $$('[data-drop]').forEach((button) => button.addEventListener('click', async () => {
-    const next = list.filter((_, i) => i !== Number(button.dataset.drop));
-    await api('/bot/allocations', { method: 'POST', body: { allocations: next } });
-    toast('Estratégia removida');
-    loadLab();
+  /* Uma posição aberta sem alocação não é avaliada por ninguém: o ciclo só
+     percorre a lista acima, então nenhuma regra de saída roda e nada vai
+     vendê-la. Ela aparece aqui, em vermelho, com o botão que resolve - em vez
+     de ficar calada somando no patrimônio para sempre. */
+  const stranded = orphans.map((o) => `
+    <div class="alloc is-orphan">
+      <div class="alloc-main">
+        <strong>${o.symbol} · posição sem estratégia</strong>
+        <span>Nenhuma regra de saída avalia esta posição — ela não será vendida
+          sozinha. Aberta em ${dt(o.entry_time)} com ${money(o.entry_quote)}.</span>
+      </div>
+      <button class="btn btn-small btn-danger" data-orphan="${o.symbol}">Encerrar</button>
+    </div>`);
+
+  if (!setHTML('#allocations-list', [...stranded, ...rows].join(''))) return;
+
+  $$('[data-drop]').forEach((button) => button.addEventListener('click', () => {
+    const index = Number(button.dataset.drop);
+    dropAllocation(list[index], list.filter((_, i) => i !== index));
   }));
+
+  $$('[data-orphan]').forEach((button) => button.addEventListener('click', async () => {
+    const symbol = button.dataset.orphan;
+    if (!confirm(`Vender agora, a preço de mercado, a posição aberta em ${symbol}?`)) return;
+    try {
+      const result = await api('/bot/close-all',
+        { method: 'POST', body: { symbols: [symbol] } });
+      toast(`${result.closed.length} posição(ões) encerrada(s)`, 'ok');
+      loadLab();
+    } catch (error) { toast(error.message, 'error'); }
+  }));
+}
+
+/* Remover é a metade destrutiva da tela, e o servidor recusa quando ela
+   deixaria uma posição sem dono. A recusa vira a pergunta que faltava —
+   vender junto, ou não fazer nada. Daqui não se cria um órfão por acidente. */
+async function dropAllocation(gone, remaining) {
+  const send = (extra) => api('/bot/allocations', {
+    method: 'POST', body: { allocations: remaining, mode: 'replace', ...extra },
+  });
+  try {
+    await send({});
+    toast(`${gone.symbol} removida do livro`);
+  } catch (error) {
+    if (error.detail?.code !== 'would_strand') { toast(error.message, 'error'); return; }
+    if (!confirm(`${error.detail.message}\n\nEncerrar a posição agora e remover a estratégia?`)) return;
+    try {
+      await send({ close_dropped: true });
+      toast(`${gone.symbol} removida e posição encerrada`, 'ok');
+    } catch (retry) { toast(retry.message, 'error'); return; }
+  }
+  loadLab();
+}
+
+/* ------------------------------------------------------ carteira inteira */
+
+/* Dezessete buscas de histórico levam vinte segundos na primeira vez. Se isso
+   entrasse no Promise.all da aba, a aba inteira esperaria vinte segundos; se
+   entrasse no ciclo de quinze, os pedidos empilhariam. Então este card carrega
+   sozinho, uma vez, e o resto da tela não espera por ele. */
+async function loadBook(force = false) {
+  if (state.bookLoading) return;
+  state.bookLoading = true;
+  renderBook(state.book);
+  try {
+    state.book = await api(`/portfolio/book${force ? '?force=true' : ''}`);
+  } catch (error) {
+    toast(`Carteira: ${error.message}`, 'error');
+  } finally {
+    state.bookLoading = false;
+    renderBook(state.book);
+  }
+}
+
+function horizonRow(horizon, label, why, extra = '') {
+  if (!horizon || !horizon.pairs) return '';
+  return `
+    <div class="book-horizon ${extra}">
+      <strong>${label}</strong>
+      <span>correlação média <b>${nf(horizon.avg_correlation, 2)}</b></span>
+      <span>${nf(horizon.effective_bets, 1)} apostas efetivas</span>
+      <span>${horizon.pairs_above_70} de ${horizon.pairs} pares acima de 0,70</span>
+      <span class="why">${why}</span>
+    </div>`;
+}
+
+function renderBook(book) {
+  const body = $('#book-body');
+  if (!body) return;
+  setText('#book-stamp', state.bookLoading ? 'calculando…'
+    : (book?.computed_at ? `medido ${dt(book.computed_at)}` : '—'));
+
+  if (!book && state.bookLoading) {
+    setHTML(body, '<p class="empty">Lendo o histórico de cada moeda…</p>');
+    return;
+  }
+  if (!book || !book.count) {
+    setHTML(body, '<p class="empty">Nenhuma alocação para analisar ainda.</p>');
+    return;
+  }
+
+  const near = book.near;
+  const deep = book.structural;
+  const exposure = book.exposure || {};
+  const settings = book.settings || {};
+
+  /* O número da frente é o estrutural: é o pior dos dois e o que não depende
+     de quinze dias terem sido calmos. */
+  const bets = deep?.effective_bets ?? near?.effective_bets ?? 0;
+  const names = deep?.measured ?? near?.measured ?? book.count;
+  const concentrated = names > 1 && bets < names / 3;
+
+  const exposureCard = exposure.samples
+    ? `<span class="book-big">${nf(exposure.avg_open, 1)}</span>
+       <span class="book-sub">de ${exposure.cap} no teto · ${
+         exposure.avg_deployed_pct === null ? '—'
+           : `${nf(100 - exposure.avg_deployed_pct, 0)}% do capital parado`}</span>`
+    : `<span class="book-big">—</span>
+       <span class="book-sub">sem histórico ainda; enche sozinho quando o robô rodar</span>`;
+
+  setHTML(body, `
+    <div class="book-hero">
+      <div class="book-stat ${concentrated ? 'is-warn' : 'is-hero'}">
+        <span class="book-label">apostas efetivas</span>
+        <span class="book-big">${nf(bets, 1)}</span>
+        <span class="book-sub">de ${names} nomes no livro</span>
+      </div>
+      <div class="book-stat">
+        <span class="book-label">exposição média</span>
+        ${exposureCard}
+      </div>
+      <div class="book-stat">
+        <span class="book-label">dispersão de risco</span>
+        <span class="book-big">${book.vol_spread ? `${nf(book.vol_spread, 2)}x` : '—'}</span>
+        <span class="book-sub">entre a moeda mais e a menos agitada</span>
+      </div>
+      <div class="book-stat">
+        <span class="book-label">teto de posições</span>
+        <span class="book-big">${exposure.cap || '—'}</span>
+        <span class="book-sub">${exposure.ceiling
+          ? `${money(exposure.ceiling, 0)} comprometidos se tudo entrar`
+          : 'defina o valor por operação'}</span>
+      </div>
+    </div>
+
+    ${concentrated ? `
+    <div class="book-verdict">
+      <b>${names} nomes que reduzem risco como ${nf(bets, 1)} reduziriam.</b>
+      As moedas sobem e descem juntas, então espalhar o dinheiro entre elas
+      protege muito menos do que a contagem de linhas sugere. Os dois controles
+      abaixo existem exatamente para isto, e estão
+      ${settings.max_correlation ? `com teto em ${nf(settings.max_correlation, 2)}` : '<b>desligados</b>'}.
+    </div>` : `
+    <div class="book-verdict is-ok">
+      <b>${names} nomes que reduzem risco como ${nf(bets, 1)} reduziriam.</b>
+      As moedas divergem o suficiente para que espalhar o dinheiro entre elas
+      valha alguma coisa.
+    </div>`}
+
+    <div class="book-horizons">
+      ${horizonRow(near, `${near?.window_days} dias · velas de ${near?.interval}`,
+        'A janela que os próprios controles enxergam. É este número que prevê quantas entradas o teto de correlação vai recusar.')}
+      ${horizonRow(deep, `${deep?.window_days} dias · velas diárias`,
+        'A estrutura de fundo, e quase sempre a pior das duas: em duas semanas duas moedas conseguem divergir, em um ano de altcoin contra dólar elas quase nunca divergem.', 'is-structural')}
+    </div>
+
+    <div class="table-wrap">
+      <table class="book-table">
+        <thead>
+          <tr>
+            <th>Moeda</th>
+            <th class="num">Agitação/dia</th>
+            <th class="num">Tamanho se ligado</th>
+            <th class="num">Corr. ${near?.window_days}d</th>
+            <th class="num">Corr. ${deep?.window_days}d</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${(book.volatility || []).map((row) => `
+          <tr>
+            <td>${row.symbol}</td>
+            <td class="num">${nf(row.volatility_pct, 2)}%</td>
+            <td class="num ${row.size_factor < 1 ? 'dim' : ''}">${
+              settings.volatility_sizing ? '' : '<span class="dim">se ligar: </span>'}${nf(row.size_factor, 2)}x</td>
+            <td class="num ${row.near_correlation > 0.7 ? 'hot' : ''}">${
+              row.near_correlation === null ? '—' : nf(row.near_correlation, 2)}</td>
+            <td class="num ${row.structural_correlation > 0.7 ? 'hot' : ''}">${
+              row.structural_correlation === null ? '—' : nf(row.structural_correlation, 2)}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`);
 }
 
 /* The collectors. The robot is drawn above by renderBot; these two neither
@@ -1392,16 +1661,43 @@ $$('#breakdown-toggle .seg-btn').forEach((button) => button.addEventListener('cl
   if (state.breakdown) renderBreakdown(state.breakdown[state.breakdownGroup]);
 }));
 
+/* O aviso conta o que mudou, não o tamanho do livro. A versão antiga dizia
+   "3 estratégia(s) prontas para operar" depois de substituir dezessete por
+   três: verdadeira, e sem uma palavra sobre as catorze que acabaram de sair. */
+function reportAllocation(config) {
+  const { added = [], swapped = [] } = config.changes || {};
+  const parts = [];
+  if (added.length) parts.push(`${added.length} adicionada(s)`);
+  if (swapped.length) parts.push(`${swapped.length} trocada(s)`);
+  const total = config.allocations.length;
+  toast(parts.length
+    ? `${parts.join(' e ')} — o livro agora opera ${total}`
+    : `Nada mudou — o livro já operava essas ${total}`, parts.length ? 'ok' : '');
+}
+
 $('#btn-allocate').addEventListener('click', async () => {
   if (!state.selected.size) { toast('Marque ao menos uma estratégia na tabela', 'error'); return; }
+  const body = { result_ids: [...state.selected], mode: 'merge' };
   try {
-    const config = await api('/bot/allocations', {
-      method: 'POST', body: { result_ids: [...state.selected] },
-    });
-    toast(`${config.allocations.length} estratégia(s) prontas para operar`, 'ok');
-    state.selected.clear();
-    loadLab();
-  } catch (error) { toast(error.message, 'error'); }
+    reportAllocation(await api('/bot/allocations', { method: 'POST', body }));
+  } catch (error) {
+    if (error.detail?.code !== 'would_rewrite') { toast(error.message, 'error'); return; }
+    if (!confirm(`${error.detail.message}\n\nTrocar mesmo assim?`)) return;
+    try {
+      reportAllocation(await api('/bot/allocations',
+        { method: 'POST', body: { ...body, force: true } }));
+    } catch (retry) { toast(retry.message, 'error'); return; }
+  }
+  state.selected.clear();
+  loadLab();
+});
+
+$('#btn-book-refresh').addEventListener('click', () => loadBook(true));
+
+$('#btn-log-clear').addEventListener('click', () => {
+  logbook.length = 0;
+  try { localStorage.removeItem(LOG_KEY); } catch (error) { /* idem */ }
+  renderLog();
 });
 
 $('#btn-close-detail').addEventListener('click', () => { $('#detail-panel').hidden = true; });
@@ -1445,5 +1741,6 @@ window.addEventListener('resize', () => {
   }
 });
 
+renderLog();
 refresh();
 setInterval(() => { if (!document.hidden) refresh({ keepScroll: true }); }, 15000);

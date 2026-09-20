@@ -509,10 +509,22 @@ class TraderBot:
         peaks.pop(str(position["id"]), None)
         storage.set_state("position_peaks", peaks)
 
-    def close_all(self, reason: str = "manual") -> list[dict[str, Any]]:
+    def close_all(self, reason: str = "manual",
+                  symbols: list[str] | None = None) -> list[dict[str, Any]]:
+        """Sell open positions. ``symbols`` narrows it to a few of them.
+
+        The filter exists because of what the tick loop does not do: it walks
+        ``config["allocations"]`` and nothing else, so a symbol that loses its
+        allocation is never evaluated again and nothing will ever sell what it
+        holds. Whoever removes an allocation closes the position in the same
+        breath instead of leaving it stranded.
+        """
         config = get_config()
+        wanted = set(symbols) if symbols is not None else None
         closed = []
         for position in self.open_positions():
+            if wanted is not None and position["symbol"] not in wanted:
+                continue
             price = float(exchange.price(position["symbol"]))
             context = {"kind": "exit", "rule": self._exit_rule(reason, st.build(
                 position["strategy"], position["params"]), position["risk"], position),

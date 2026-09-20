@@ -413,6 +413,94 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 .alloc-main strong { font-size: 13.5px; }
 .alloc-main span { font-size: 11.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; }
 
+/* Posição aberta que perdeu a estratégia: ninguém a avalia, ninguém a vende. */
+.alloc.is-orphan {
+  border-color: rgba(255, 95, 112, 0.4);
+  background: linear-gradient(180deg, var(--neg-soft), transparent 140%);
+}
+.alloc.is-orphan .alloc-main strong { color: var(--neg); }
+.alloc.is-orphan .alloc-main span { white-space: normal; color: var(--muted); }
+
+/* ------------------------------------------------------- carteira inteira */
+
+.book-hero {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 11px; margin-bottom: 14px;
+}
+.book-stat {
+  padding: 13px 15px; border-radius: 11px;
+  background: var(--surface-2); border: 1px solid var(--border-soft);
+}
+.book-stat.is-hero { border-color: var(--accent); background: var(--accent-soft); }
+.book-stat.is-warn { border-color: rgba(247, 185, 85, 0.45); }
+.book-label {
+  display: block; font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.07em; color: var(--faint);
+}
+.book-big {
+  display: block; margin: 5px 0 3px;
+  font-size: 27px; line-height: 1; font-variant-numeric: tabular-nums;
+}
+.book-stat.is-hero .book-big { color: var(--accent); }
+.book-stat.is-warn .book-big { color: var(--warn); }
+.book-sub { display: block; font-size: 11.5px; color: var(--muted); }
+
+.book-horizons { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.book-horizon {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px;
+  padding: 10px 13px; border-radius: 9px;
+  background: var(--surface-2); border-left: 2px solid var(--border);
+}
+.book-horizon.is-structural { border-left-color: var(--warn); }
+.book-horizon strong { font-size: 12.5px; }
+.book-horizon span { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.book-horizon .why { flex-basis: 100%; font-size: 11.5px; color: var(--faint); }
+
+.book-verdict {
+  padding: 11px 14px; border-radius: 9px; margin-bottom: 14px;
+  font-size: 12.5px; line-height: 1.5;
+  background: rgba(247, 185, 85, 0.1); border: 1px solid rgba(247, 185, 85, 0.3);
+  color: var(--text);
+}
+.book-verdict.is-ok { background: var(--pos-soft); border-color: rgba(25, 214, 155, 0.3); }
+.book-verdict b { color: var(--warn); }
+.book-verdict.is-ok b { color: var(--pos); }
+
+.book-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.book-table th {
+  text-align: left; font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--faint); font-weight: 600;
+  padding: 0 9px 7px; white-space: nowrap;
+}
+.book-table th.num, .book-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.book-table td { padding: 7px 9px; border-top: 1px solid var(--border-soft); }
+.book-table td:first-child { font-weight: 600; }
+.book-table .dim { color: var(--faint); }
+.book-table .hot { color: var(--warn); }
+
+/* ----------------------------------------------------- histórico de avisos */
+
+.logrow {
+  display: grid; grid-template-columns: auto 1fr auto; gap: 11px; align-items: baseline;
+  padding: 8px 11px; border-radius: 8px;
+  border-left: 2px solid var(--border);
+  background: var(--surface-2);
+}
+.logrow + .logrow { margin-top: 5px; }
+.logrow.is-error { border-left-color: var(--neg); }
+.logrow.is-ok { border-left-color: var(--pos); }
+
+.logrow-time {
+  font-family: var(--mono); font-size: 11px; color: var(--faint);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.logrow-msg { font-size: 12.5px; color: var(--text); min-width: 0; overflow-wrap: anywhere; }
+.logrow.is-error .logrow-msg { color: var(--neg); }
+.logrow-count {
+  font-size: 10.5px; padding: 1px 7px; border-radius: 999px;
+  background: var(--surface-3); color: var(--muted); white-space: nowrap;
+}
+
 .catalog { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 11px; }
 .catalog-card {
   padding: 13px 14px; border: 1px solid var(--border-soft);
