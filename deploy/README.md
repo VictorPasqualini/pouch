@@ -119,3 +119,156 @@ Everything above is written for the testnet keys. A host that holds live
 credentials needs more than this: disk encryption, no shared account, key
 rotation, and an answer to what happens if the machine is compromised while a
 position is open. `deploy/install.sh` locks `.env` to mode 600 and nothing else.
+
+## Atualizando uma instalação que já está rodando
+
+O forward test é medido em tempo ligado, e a contagem de velas perdidas nunca
+expira. Então uma atualização tem dois custos: o tempo parado, e o risco de a
+migração de schema apagar algo. Os passos abaixo tratam os dois.
+
+**Antes de qualquer coisa, saiba o que muda.** Numa atualização que só mexe em
+interface e relatório, nenhum módulo de negociação é tocado — `live.py`,
+`exchange.py`, `strategies.py`, `backtest.py`, `research.py`, `walkforward.py`,
+`parity.py`, `coverage.py`, `tracking.py` e `portfolio.py` ficam idênticos. Isso
+importa: significa que a paridade acumulada continua comparável e o teste não
+recomeça. Confirme antes de subir:
+
+```bash
+git diff --stat main..sua-branch -- bot/live.py bot/exchange.py bot/strategies.py     bot/backtest.py bot/research.py bot/walkforward.py bot/parity.py     bot/coverage.py bot/tracking.py bot/portfolio.py
+```
+
+Saída vazia = a lógica de operação não mudou.
+
+### 1. Faça backup do banco pela API do SQLite, nunca com `cp`
+
+O WAL pode conter megabytes que ainda não foram para o arquivo principal. Uma
+cópia crua descarta isso em silêncio.
+
+```bash
+sudo -u pouch /opt/pouch/.venv/bin/python - <<'EOF'
+import sqlite3, datetime
+stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+src = sqlite3.connect("/opt/pouch/data/trader.db")
+dst = sqlite3.connect(f"/opt/pouch/data/trader-{stamp}.bak.db")
+src.backup(dst); dst.close(); src.close()
+print("backup em trader-%s.bak.db" % stamp)
+EOF
+```
+
+Confirme que o arquivo existe e tem tamanho parecido com o original antes de
+seguir. **Este é o único passo que não dá para desfazer se for pulado.**
+
+### 2. Saiba o que a migração vai apagar
+
+`storage.init()` roda `DROPPED_TABLES` e `DROPPED_KEYS` a cada início. Tabelas
+de funcionalidades removidas são derrubadas para que o arquivo em disco
+corresponda ao schema no código. **Isso é irreversível.** Veja o que existe hoje:
+
+```bash
+sudo -u pouch sqlite3 /opt/pouch/data/trader.db   "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+```
+
+Cruze com `DROPPED_TABLES` em `bot/storage.py`. Se alguma coisa dessa lista
+importa para você, o backup do passo 1 é onde ela vai continuar existindo.
+
+### 3. Entenda como o código chega lá: não é `git`
+
+`/opt/pouch` **não é um repositório git.** O `install.sh` popula o alvo com
+
+```
+rsync -a --delete --exclude '.git' --exclude '.venv' \
+      --exclude '__pycache__' --exclude 'data' --exclude '.env' \
+      "$SOURCE/" /opt/pouch/
+```
+
+Ou seja: não existe `.git` ali, não há branch para trocar, e `git checkout`
+dentro de `/opt/pouch` falha. O que existe é um destino de implantação, e a
+origem é um checkout em outro lugar — na sua máquina ou num clone no host.
+
+As exclusões são a parte importante: `data`, `.env` e `.venv` **ficam de fora**,
+então o banco, as chaves e o ambiente sobrevivem a qualquer redeploy.
+
+### 4. Atualize com o próprio `install.sh`
+
+Ele foi escrito para ser reexecutado: cada passo cria o que falta ou atualiza o
+que existe. É o mecanismo de atualização, não só o de instalação.
+
+**Se você mantém um clone no host:**
+
+```bash
+cd ~/pouch                      # ou onde estiver o checkout
+git fetch origin
+git checkout sua-branch
+git pull
+```
+
+**Se você envia da sua máquina:**
+
+```bash
+rsync -az --delete --exclude '.git' --exclude '.venv' --exclude 'data' \
+      --exclude '.env' --exclude '__pycache__' \
+      ./ <user>@<host>:~/pouch/
+```
+
+Escolha o momento: logo **depois** de um fechamento de vela de 4h (00:00, 04:00,
+08:00… UTC) dá quase quatro horas de folga antes do próximo. Parar minutos antes
+de um fechamento custa uma vela na contagem de presença, e ela não expira.
+
+```bash
+sudo bash ~/pouch/deploy/install.sh ~/pouch
+```
+
+O script faz o rsync, atualiza as dependências, corrige permissões e reinicia o
+serviço. Não é preciso parar nada antes — o `Restart=always` da unidade e o
+`systemctl restart` no fim do script cuidam disso.
+
+Dependências que **saíram** do `requirements.txt` continuam instaladas no venv:
+`pip install -r` não desinstala nada. Isso é proposital — remover é uma ação
+separada, feita quando você quiser o espaço de volta.
+
+### 5. Verifique antes de ir embora
+
+```bash
+systemctl --no-pager --lines=30 status pouch
+curl -s localhost:8777/api/status | python3 -m json.tool | head -20
+curl -s localhost:8777/api/processes | python3 -m json.tool
+```
+
+O que precisa estar verdadeiro:
+
+- `exchange.market_data` e `exchange.account` em `true`
+- `bot.running` em `true`, se o robô estava ligado antes
+- as tabelas de feed intactas:
+  `sudo -u pouch sqlite3 /opt/pouch/data/trader.db "SELECT COUNT(*) FROM feed_observations;"`
+  com o mesmo número de antes, ou maior
+- nenhuma linha de `Traceback` no journal
+
+### 6. Se der errado
+
+Voltar é reexecutar o `install.sh` a partir do checkout antigo, e restaurar o
+banco:
+
+```bash
+cd ~/pouch && git checkout <commit-anterior>
+sudo systemctl stop pouch
+sudo -u pouch cp /opt/pouch/data/trader-<stamp>.bak.db /opt/pouch/data/trader.db
+sudo -u pouch rm -f /opt/pouch/data/trader.db-wal /opt/pouch/data/trader.db-shm
+sudo bash ~/pouch/deploy/install.sh ~/pouch
+```
+
+Apagar o `-wal` e o `-shm` é obrigatório ao restaurar: um WAL velho seria
+reaplicado sobre um banco diferente, e o resultado não é o backup nem o estado
+atual.
+
+### O que **não** fazer
+
+- **Não espere trocar de branch dentro de `/opt/pouch`.** Não há `.git` ali. A
+  branch se troca no checkout de origem, e o `install.sh` carrega o resultado.
+- **Não faça merge em `main` se o checkout de origem segue `main`.** O forward
+  test vale porque nada mudou embaixo dele. Mantenha a máquina numa branch e
+  faça o merge quando o teste terminar.
+- **Não chame `POST /api/coverage/baseline`** para limpar velas perdidas de uma
+  janela de manutenção. Ele existe para uma mudança de hospedagem. Usá-lo porque
+  o número ficou feio faz o número deixar de medir qualquer coisa.
+- **Não pule o backup do passo 1.** A migração de schema derruba tabelas de
+  funcionalidades removidas no primeiro início, e isso não tem volta.

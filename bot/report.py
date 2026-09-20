@@ -590,6 +590,67 @@ def readiness() -> dict[str, Any]:
     }
 
 
+def monthly() -> dict[str, Any]:
+    """Realised result, month by month, with the running total beside it.
+
+    Only closed trades appear. A month is credited on the exit, not the entry,
+    because that is when the money actually moved - a position opened in March
+    and sold in May made its money in May, and splitting it across three months
+    would invent a result for two of them.
+
+    Open positions are therefore absent by construction, and the totals here
+    will not match the dashboard's P&L while anything is still held. That gap
+    is the unrealised column, and it is reported next to this rather than
+    smeared into whichever month happens to be current.
+    """
+    closed = storage.query(
+        "SELECT exit_time, pnl, return_pct FROM positions"
+        " WHERE status = 'closed' AND exit_time IS NOT NULL ORDER BY exit_time")
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in closed:
+        key = str(row["exit_time"])[:7]
+        bucket = buckets.setdefault(key, {"month": key, "trades": 0, "pnl": 0.0,
+                                          "wins": 0, "losses": 0})
+        pnl = float(row["pnl"] or 0.0)
+        bucket["trades"] += 1
+        bucket["pnl"] += pnl
+        bucket["wins" if pnl > 0 else "losses"] += 1
+
+    start = float(get_config().get("start_capital", 10_000.0))
+    running = start
+    months = []
+    for key in sorted(buckets):
+        bucket = buckets[key]
+        opening = running
+        running += bucket["pnl"]
+        months.append({
+            **bucket,
+            "pnl": round(bucket["pnl"], 2),
+            # Measured against the capital the month opened with, so a good
+            # month early and the same cash later do not read as equal.
+            "return_pct": round(bucket["pnl"] / opening * 100, 3) if opening else 0.0,
+            "win_rate_pct": round(bucket["wins"] / bucket["trades"] * 100, 1),
+            "equity_end": round(running, 2),
+        })
+
+    best = max(months, key=lambda m: m["pnl"], default=None)
+    worst = min(months, key=lambda m: m["pnl"], default=None)
+    years = sorted({m["month"][:4] for m in months})
+    return {
+        "months": months,
+        # The years that actually have trades, so the picker offers only what
+        # can be looked at. A year with no rows is not a choice, it is a dead
+        # button.
+        "years": years,
+        "start_capital": start,
+        "realised_total": round(running - start, 2),
+        "profitable_months": sum(1 for m in months if m["pnl"] > 0),
+        "best": best,
+        "worst": worst,
+    }
+
+
 def breakdown() -> dict[str, list[dict[str, Any]]]:
     """Closed-trade performance sliced by strategy and by coin.
 

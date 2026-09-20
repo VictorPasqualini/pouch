@@ -12,52 +12,28 @@ const state = {
   selected: new Set(),
   researchTimer: null,
   detailCurve: null,
-  tradesMode: 'live',
   breakdown: null,
   breakdownGroup: 'by_strategy',
-  book: 'live',
-  lab: null,
-  exit: null,
-};
-
-/* The two books, side by side and measured identically. The live one is a
-   forward test of strategies that already survived a walk-forward; the other is
-   an experiment that is allowed to be wrong. Keeping them on one screen with
-   one set of metrics is the whole point - a comparison where each side reports
-   its own favourite number is not a comparison. */
-const BOOKS = {
-  live: {
-    label: 'Livro validado',
-    hint: 'Estratégias que passaram na caminhada para a frente, operando adiante '
-        + 'sem reajuste. $100 por posição, teto de 11 posições. '
-        + 'Abaixo, o estudo de saída roda sobre estas mesmas operações.',
-    overview: '/overview',
-    equity: '/equity',
-    events: 'bot',
-  },
-  ml: {
-    label: 'Laboratório ML',
-    hint: 'Modelo de ranking treinado do zero, com liberdade para errar. Escolhe '
-        + 'as 3 melhores moedas do dia entre as 18 e rebalanceia por semana. '
-        + '$100 por posição.',
-    overview: '/lab/overview',
-    equity: '/lab/equity',
-    events: 'lab',
-  },
+  feeds: null,
+  processes: [],
+  monthlyYear: null,
+  monthlyData: null,
 };
 
 const VIEW_META = {
   dashboard: ['Painel', 'Resultado consolidado das estratégias em operação'],
-  lab: ['Pesquisa', 'Otimiza no histórico antigo e valida no que ficou de fora'],
-  trades: ['Operações', 'Cada entrada e saída, moeda a moeda, com o sinal que a disparou'],
-  validation: ['Validação', 'A mesma configuração testada trimestre a trimestre, sem reajuste'],
-  settings: ['Ajustes', 'Modo de execução, risco por operação e estratégias ativas'],
+  lab: ['Estratégias', 'O que está ligado, com quanto opera, e de onde saem as alocações'],
 };
 
 /* ------------------------------------------------------------------- utils */
 
 async function api(path, options = {}) {
-  const response = await fetch(`/api${path}`, {
+  /* Callers pass a path relative to the API root - `/overview`, not
+     `/api/overview`. One caller could not: the process roster hands back the
+     routes to call, and those are real paths, so prefixing them again produced
+     `/api/api/sentiment/stop` and a silent 404 behind a toast. Accepting both
+     forms here kills the whole class of it, at the one place that builds URLs. */
+  const response = await fetch(path.startsWith('/api/') ? path : `/api${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...options,
     body: options.body ? JSON.stringify(options.body) : undefined,
@@ -75,7 +51,6 @@ const money = (value, digits = 2) => `$${nf(value, digits)}`;
 const signed = (value, digits = 2) => `${value >= 0 ? '+' : ''}${nf(value, digits)}`;
 const pct = (value, digits = 2) => `${signed(value, digits)}%`;
 const cls = (value) => (value > 0 ? 'pos' : value < 0 ? 'neg' : '');
-const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
 
 function dt(iso, withTime = true) {
   if (!iso) return '—';
@@ -101,12 +76,42 @@ function setText(id, value, className) {
   if (className !== undefined) el.className = el.className.replace(/\b(pos|neg)\b/g, '').trim() + ' ' + className;
 }
 
+/* Every panel is redrawn on a fifteen-second poll, and a book of daily
+   strategies has nothing new to say on almost all of those ticks. Writing
+   innerHTML anyway is what moved the page: the browser drops the subtree,
+   lays the document out again, and the scroll offset is clamped to whatever
+   height the page had while the new markup was still being built.
+
+   So the markup is compared before it is written, and an identical redraw
+   costs a string compare instead of a layout. The previous string is kept on
+   the node rather than read back from `innerHTML`, because that getter
+   returns the browser's own re-serialisation - attributes reordered, entities
+   re-encoded - which almost never matches what was set and would make every
+   comparison miss.
+
+   Returns whether it actually wrote, because listeners bound to the new
+   children must only be bound when there are new children. Re-binding after a
+   skipped write would stack a fresh listener on the same node every tick. */
+function setHTML(target, html) {
+  const el = typeof target === 'string' ? $(target) : target;
+  if (!el || el.__html === html) return false;
+  el.__html = html;
+  el.innerHTML = html;
+  return true;
+}
+
 /* ------------------------------------------------------------------ charts */
 
 function drawChart(canvas, series, { fill = true, tipTarget = null, format = money } = {}) {
   const dpr = window.devicePixelRatio || 1;
   const width = canvas.clientWidth || canvas.parentElement.clientWidth;
-  const height = Number(canvas.getAttribute('height'));
+  /* The `height` attribute is also the backing-store size, and the line below
+     overwrites it with height * dpr. Reading it back on the next draw fed that
+     product in as the new intent and multiplied again - 240, then 300, then
+     375 on a 1.25x display - so the chart grew a little on every fifteen-second
+     tick and never stopped. The CSS height is the intention, so it is read once
+     and remembered on the node instead of recovered from a field we clobber. */
+  const height = canvas.__h ?? (canvas.__h = Number(canvas.getAttribute('height')) || 240);
   canvas.width = width * dpr;
   canvas.height = height * dpr;
   canvas.style.height = `${height}px`;
@@ -220,9 +225,69 @@ function attachTip(canvas, tip, series, geo, format = money) {
     tip.hidden = false;
     tip.style.left = `${geo.xAt(index, len)}px`;
     tip.style.top = `${geo.yAt(point.y)}px`;
-    tip.innerHTML = `<b>${format(point.y)}</b><span>${dt(point.t)}</span>`;
+    setHTML(tip, `<b>${format(point.y)}</b><span>${dt(point.t)}</span>`);
   };
   canvas.onmouseleave = () => { tip.hidden = true; };
+}
+
+/* ------------------------------------------------------------------- gates */
+
+/* Six conditions, on one line. They used to own a screen that said "não" in
+   full sentences; that screen is gone and the question it asked is not. A
+   strip costs one row and still answers it, and the detail travels in the
+   tooltip rather than in a paragraph nobody reads twice.
+
+   The order is the order they clear in. Execution first - does the engine do
+   what the model says - because until that holds, nothing else on the line
+   means anything: a book that is profitable while filling somewhere the
+   backtest never modelled is profitable by accident. */
+const GATE_SHORT = {
+  validation: 'validação',
+  parity: 'paridade',
+  coverage: 'presença',
+  sample: 'amostra',
+  tracking: 'previsto',
+  drawdown: 'rebaixamento',
+};
+
+async function loadGates() {
+  let data;
+  try {
+    data = await api('/readiness');
+  } catch {
+    /* The readiness report walks every allocation forward and can fail on its
+       own; that is not a reason to take the dashboard down with it. */
+    $('#gatebar').hidden = true;
+    return;
+  }
+  const gates = data.gates || [];
+  $('#gatebar').hidden = gates.length === 0;
+  if (!gates.length) return;
+
+  const done = gates.filter((g) => g.ok).length;
+  setText('#gatebar-verdict', `${done}/${gates.length}`);
+  $('#gatebar-verdict').className = `gatebar-verdict ${data.ready ? 'is-ready' : ''}`;
+
+  /* The same answer twice: once as a count, once in words. The count says how
+     far along; the word says what to do with the numbers on the rest of the
+     screen. A dashboard that only shows the fraction invites reading a rising
+     equity curve as a result while three of the six are still open. */
+  const trust = $('#gatebar-trust');
+  trust.textContent = data.ready ? 'confiável' : 'não confiável';
+  trust.className = `gatebar-trust ${data.ready ? 'is-ok' : 'is-bad'}`;
+  trust.title = data.ready
+    ? 'Os seis portões fecharam: o motor executa o que o modelo diz e o '
+      + 'resultado ao vivo se comporta como o medido.'
+    : `Faltam ${gates.length - done} de ${gates.length} portões. Os números `
+      + 'desta tela são reais, mas ainda não constituem evidência de que a '
+      + 'vantagem existe — nem de que o motor executa o que foi medido.';
+
+  setHTML('#gatebar-items', gates.map((gate) => `
+    <span class="gatepill ${gate.ok ? 'is-ok' : ''}" title="${escape(gate.label)} — ${escape(gate.detail || '')}">
+      <i class="gatedot"></i>${GATE_SHORT[gate.key] || gate.key}
+      ${gate.progress != null && !gate.ok
+        ? `<b>${nf(gate.progress * 100, 0)}%</b>` : ''}
+    </span>`).join(''));
 }
 
 /* --------------------------------------------------------------- dashboard */
@@ -238,10 +303,6 @@ async function loadStatus() {
   $('#brand-mode').textContent = bot.mode === 'paper' ? 'papel' : (exchange.testnet ? 'testnet' : 'REAL');
   $('#free-balance').textContent = exchange.account ? money(exchange.quote_balance) : '—';
 
-  const toggle = $('#btn-toggle-bot');
-  toggle.textContent = bot.running ? 'Parar robô' : 'Ligar robô';
-  toggle.className = `btn ${bot.running ? 'btn-danger' : 'btn-primary'}`;
-
   if (!exchange.account && exchange.account_error) {
     $('#free-balance').textContent = 'sem chave';
   }
@@ -249,25 +310,11 @@ async function loadStatus() {
 }
 
 async function loadDashboard() {
-  const book = BOOKS[state.book];
-  $$('[data-book-only]').forEach((panel) => {
-    panel.hidden = !panel.dataset.bookOnly.split(' ').includes(state.book);
-  });
-  $('#book-hint').textContent = book.hint;
-  $$('#book-toggle .seg-btn').forEach((button) =>
-    button.classList.toggle('is-on', button.dataset.book === state.book));
-
-  /* Filtered by book. Three books writing into one feed makes the feed
-     useless: what a reader wants from it is what the book in front of them
-     just did, and interleaving three makes that impossible to see. */
-  const [overview, equity, events] = await Promise.all([
-    api(book.overview), api(book.equity), api(`/events?limit=30&source=${book.events}`),
+  const [overview, equity] = await Promise.all([
+    api('/overview'), api('/equity'),
   ]);
   state.overview = overview;
   state.equity = equity;
-
-  $('#book-hint').textContent =
-    `${book.hint} Capital de ${money(overview.start_capital, 0)}.`;
 
   setText('#kpi-equity', money(overview.total_value));
   setText('#kpi-equity-delta',
@@ -279,498 +326,129 @@ async function loadDashboard() {
     `realizado ${money(overview.realised_pnl)} · aberto ${money(overview.unrealised_pnl)}`);
   setText('#kpi-winrate', `${nf(overview.win_rate_pct, 1)}%`);
   setText('#kpi-winrate-sub', `${overview.wins}G / ${overview.losses}P em ${overview.closed_trades}`);
-  setText('#kpi-pf', overview.profit_factor >= 999 ? '∞' : nf(overview.profit_factor, 2));
-  setText('#kpi-dd', `${nf(overview.max_drawdown_pct, 2)}%`);
-  renderLastKpi(overview);
-
-  renderPnl(overview);
   renderEquity(equity, overview);
   renderPositions(overview.positions);
-  renderEvents(events);
 
-  if (state.book === 'live') {
-    const breakdown = await api('/breakdown');
-    state.breakdown = breakdown;
-    renderBreakdown(breakdown[state.breakdownGroup || 'by_strategy']);
-    await loadSignals();
-    /* The study lives in this tab because it is this book: the same trades,
-       exited four ways. Putting it in a tab of its own asked the reader to
-       hold the validated book's numbers in their head while looking at it. */
-    await loadExitBook(overview);
-  } else {
-    await loadLabBook(overview);
-  }
+  const breakdown = await api('/breakdown');
+  state.breakdown = breakdown;
+  renderBreakdown(breakdown[state.breakdownGroup || 'by_strategy']);
+  state.monthlyData = await api('/monthly');
+  renderMonthly(state.monthlyData);
+  await loadPanelTrades();
+  await loadGates();
 }
 
-/* ------------------------------------------------------------- exit study */
-
-/* One colour per arm, fixed here so the tile, the chart line and the legend all
-   agree. The control is white on purpose: every other line is read against it. */
-const EXIT_COLORS = {
-  rule: '#e8edf7', t2: '#19d69b', t5: '#f2c14e', t10: '#5b7cfa',
-};
-
-async function loadExitBook(liveOverview) {
-  const [overview, open, closed, events, curves] = await Promise.all([
-    api('/mirror/overview'),
-    api('/mirror/positions'),
-    api('/mirror/trades?limit=200'),
-    api('/events?limit=30&source=mirror'),
-    api('/mirror/equity?limit=500'),
-  ]);
-  state.exit = overview;
-
-  $('#btn-exit-toggle').textContent = overview.running ? 'Parar' : 'Ligar';
-  $('#btn-exit-toggle').classList.toggle('btn-danger', !!overview.running);
-  $('#btn-exit-toggle').classList.toggle('btn-primary', !overview.running);
-
-  /* Said in words, at the top, before any number. Four arms and a handful of
-     trades cannot separate exits that differ by a couple of points a trade, and
-     a panel that shows a ranking without saying so invites reading a winner out
-     of noise. */
-  setText('#exit-note',
-    `${overview.note} ${overview.closed_trades} de ~${overview.trades_needed} `
-    + `operações fechadas. Começou em ${dt(overview.started_at)}`
-    + `${overview.last_tick ? ` · último ciclo ${dt(overview.last_tick)}` : ''}.`,
-    overview.conclusive ? '' : 'muted');
-
-  renderExitArms(overview, liveOverview);
-  renderExitEquity(curves, overview);
-  renderExitPaired(overview);
-  renderExitLedger(open, closed);
-  renderEvents(events, '#exit-events-list');
-}
-
-/* One sentence, under the chart. The paired difference is the whole result of
-   the study - each pair is the same trade with two exits, so the mean
-   difference is the effect and nothing else - and it used to take four cards
-   and a nine-column table to say it.
-
-   The sample size travels with it. A verdict with no count is an invitation to
-   read a winner out of four arms and a handful of trades, and below |t| = 2 the
-   difference is inside its own scatter whichever way it points. */
-function exitVerdict(overview) {
-  const parts = Object.entries(overview.paired).map(([arm, data]) => {
-    const target = `+${arm.slice(1)}%`;
-    if (!data.trades) {
-      return data.waiting
-        ? `${target}: ${data.waiting} vendida${data.waiting > 1 ? 's' : ''} no alvo, regra ainda segurando`
-        : `${target}: sem par ainda`;
-    }
-    const pp = data.rule_minus_target_pp;
-    if (data.t_stat === null || Math.abs(data.t_stat) < 2) {
-      return `${target}: ${signed(pp, 2)} pp em ${data.trades} pares, dentro do ruído`;
-    }
-    return `${target}: ${pp > 0 ? 'regra' : 'alvo'} à frente por `
-      + `${nf(Math.abs(pp), 2)} pp em ${data.trades} pares`;
-  });
-  return `Regra menos alvo, por operação — ${parts.join(' · ')}. `
-    + `${overview.note} ${overview.closed_trades} de ~${overview.trades_needed} fechadas.`;
-}
-
-function renderExitEquity(curves, overview) {
-  const canvas = $('#exit-equity-chart');
-  const empty = $('#exit-equity-empty');
-  const names = overview.arms.map((arm) => arm.arm);
-  const longest = Math.max(0, ...names.map((name) => (curves[name] || []).length));
-  if (longest < 2) {
-    canvas.style.display = 'none';
-    empty.hidden = false;
-    $('#exit-legend').innerHTML = '';
-    setText('#exit-equity-range', '—');
+/* Months are drawn against the largest month in either direction, not against
+   a fixed scale, so the shape is readable whether the book makes tens or
+   thousands. The baseline is shared and centred: a loss is on the other side
+   of it rather than a number with a minus sign to be parsed. */
+function renderMonthly(data) {
+  const all = data.months || [];
+  const years = data.years || [];
+  $('#monthly-empty').hidden = all.length > 0;
+  if (!all.length) {
+    setHTML('#monthly-list', '');
+    setHTML('#monthly-years', '');
+    setText('#monthly-summary', '—');
     return;
   }
-  canvas.style.display = 'block';
-  empty.hidden = true;
 
-  const series = names.map((name) => ({
-    points: (curves[name] || []).map((row) => ({ t: row.ts, y: row.total_value })),
-    color: EXIT_COLORS[name] || '#8b94b2',
-    width: name === 'rule' ? 2.5 : 1.8,
-  }));
-  const spine = curves[names[0]] || [];
-  series.push({
-    points: spine.map((row) => ({ t: row.ts, y: overview.capital })),
-    color: 'rgba(255,255,255,0.18)', width: 1, dash: [4, 4],
+  /* The year defaults to the most recent one with trades, and sticks once the
+     reader picks another - a poll that quietly snapped the view back to the
+     current year every fifteen seconds would make the picker useless. */
+  if (!years.includes(state.monthlyYear)) state.monthlyYear = years[years.length - 1];
+  const year = state.monthlyYear;
+
+  setHTML('#monthly-years', years.map((y) => `
+    <button class="seg-btn ${y === year ? 'is-on' : ''}" data-year="${y}">${y}</button>`).join(''));
+
+  /* Twelve slots, always, whether or not the book traded in them. A year drawn
+     only over the months that happened silently rescales itself: three
+     columns in January and twelve in December, and the same bar means
+     something different each time you look. An empty month is also a fact -
+     it says the book stood still, which is most of what this book does. */
+  const byMonth = new Map(all.map((m) => [m.month, m]));
+  const slots = Array.from({ length: 12 }, (_, i) => {
+    const key = `${year}-${String(i + 1).padStart(2, '0')}`;
+    return byMonth.get(key) || { month: key, pnl: 0, trades: 0, win_rate_pct: 0, empty: true };
   });
-  /* No fill: four shaded areas stacked on one canvas hide each other, and the
-     answer here is where the lines separate, not the area under any of them. */
-  drawChart(canvas, series, { fill: false, tipTarget: $('#exit-equity-tip') });
 
-  $('#exit-legend').innerHTML = overview.arms.map((arm) => `
-    <span class="legend-item"><i class="legend-swatch"
-      style="border-top-color:${EXIT_COLORS[arm.arm] || '#8b94b2'}"></i>${arm.label}</span>`).join('')
-    + '<span class="legend-item"><i class="legend-swatch"'
-    + ' style="border-top-color:rgba(255,255,255,0.4);border-top-style:dashed"></i>capital de partida</span>';
-
-  setText('#exit-equity-range', `${dt(spine[0].ts)} — ${dt(spine[spine.length - 1].ts)}`);
-}
-
-function renderExitArms(overview, liveOverview) {
-  /* The control arm is the validated book, restricted to the trades mirrored
-     since the study started. Saying so is the whole comparison: the tiles at
-     the top of this tab cover a longer span, so the two sets of numbers are
-     the same money over different periods and only the table below is a
-     like-for-like read. */
-  setText('#exit-scope', liveOverview
-    ? `Livro validado no total: ${money(liveOverview.total_pnl)} em `
-      + `${liveOverview.closed_trades} operações fechadas, sobre `
-      + `${money(liveOverview.start_capital, 0)}. A linha "regra decide" abaixo é `
-      + 'este mesmo livro, limitado ao que o estudo espelhou, com o mesmo '
-      + `$${nf(overview.quote_per_trade, 0)} por posição sobre `
-      + `${money(overview.capital, 0)}.`
-    : '—');
-  $('#exit-arms-table tbody').innerHTML = overview.arms.map((arm) => `
-    <tr${arm.arm === 'rule' ? ' class="row-strong"' : ''}>
-      <td><i class="legend-swatch"
-             style="border-top-color:${EXIT_COLORS[arm.arm] || '#8b94b2'}"></i>${arm.label}</td>
-      <td class="num">${money(arm.total_value)}</td>
-      <td class="num ${cls(arm.return_pct)}">${pct(arm.return_pct)}</td>
-      <td class="num ${cls(arm.vs_rule_pct)}">${arm.arm === 'rule' ? '—' : pct(arm.vs_rule_pct)}</td>
-      <td class="num">${arm.closed_trades} fechada${arm.closed_trades === 1 ? '' : 's'}
-        <span class="muted">· ${arm.open_positions} aberta${arm.open_positions === 1 ? '' : 's'}</span></td>
-    </tr>`).join('');
-
-  setText('#exit-note', exitVerdict(overview), overview.conclusive ? '' : 'muted');
-}
-
-function renderExitPaired(overview) {
-  const rows = Object.entries(overview.paired).filter(([, data]) => data.trades > 0);
-  $('#exit-paired-empty').hidden = rows.length > 0;
-  $('#exit-paired-table tbody').innerHTML = rows.map(([arm, data]) => `<tr>
-      <td>+${arm.slice(1)}%</td>
-      <td class="num">${data.trades}</td>
-      <td class="num ${cls(data.rule_minus_target_pp)}">${signed(data.rule_minus_target_pp, 2)} pp</td>
-      <td class="num">${nf(data.sd_pp, 2)} pp</td>
-      <td class="num">${data.t_stat === null ? '—' : nf(data.t_stat, 2)}</td>
-      <td class="num">${data.rule_ahead}</td>
-      <td class="num">${data.target_ahead}</td>
-      <td class="num">${data.identical}</td>
-    </tr>`).join('');
-  setText('#exit-paired-note',
-    rows.length ? `${rows[0][1].trades} pares por alvo, no máximo` : 'sem pares ainda');
-
-  /* The pairs themselves. A mean from trades the reader cannot see is a number
-     to take on trust, and pairing is exactly the design where every row can be
-     checked by hand. */
-  const pairs = Object.entries(overview.paired)
-    .flatMap(([arm, data]) => (data.rows || []).map((row) => ({ arm, ...row })))
-    .sort((a, b) => String(b.rule_exit).localeCompare(String(a.rule_exit)));
-  $('#exit-pairs-empty').hidden = pairs.length > 0;
-  $('#exit-pairs-table tbody').innerHTML = pairs.map((row) => `<tr>
-      <td>+${row.arm.slice(1)}%</td>
-      <td>${row.symbol}</td>
-      <td class="muted">${dt(row.entry_time)}</td>
-      <td class="num ${cls(row.target_pct)}">${signed(row.target_pct, 2)}%</td>
-      <td class="num ${cls(row.rule_pct)}">${signed(row.rule_pct, 2)}%</td>
-      <td class="num ${cls(row.delta_pp)}">${signed(row.delta_pp, 2)} pp</td>
-      <td class="muted">${row.target_reason || '—'}</td>
-    </tr>`).join('');
-}
-
-function renderExitLedger(open, closed) {
-  const label = (row) => (row.target_pct == null ? 'regra decide' : `+${nf(row.target_pct, 0)}%`);
-  const rows = [...open, ...closed];
-  $('#exit-ledger-empty').hidden = rows.length > 0;
-  setText('#exit-ledger-note', `${open.length} abertas · ${closed.length} fechadas`);
-  $('#exit-ledger-table tbody').innerHTML = rows.map((row) => `<tr>
-      <td>${label(row)}</td>
-      <td class="mono">${row.symbol}</td>
-      <td>${row.status === 'open' ? 'aberta' : 'fechada'}${row.adopted ? ' <span class="muted">herdada</span>' : ''}</td>
-      <td class="num mono">${num(row.entry_price)}</td>
-      <td class="num mono">${row.target_price == null ? '—' : num(row.target_price)}</td>
-      <td class="num mono">${row.exit_price == null ? '—' : num(row.exit_price)}</td>
-      <td class="num ${cls(row.pnl)}">${row.pnl == null ? '—' : `${money(row.pnl)} (${pct(row.return_pct)})`}</td>
-      <td class="muted">${row.reason || '—'}</td>
-    </tr>`).join('');
-}
-
-/* The sixth tile carries a different fact in each book. The live one has enough
-   equity snapshots for a Sharpe ratio; the experiment does not, and would only
-   be reporting the noise in a week of paper trading. What it has instead is the
-   information coefficient from its walk-forward, which is the number that says
-   whether the ranking works at all. */
-function renderLastKpi(overview) {
-  if (state.book === 'live') {
-    setText('#kpi-last-label', 'Sharpe');
-    setText('#kpi-sharpe', nf(overview.sharpe, 2));
-    setText('#kpi-last-sub', 'retorno por unidade de risco');
-    return;
-  }
-  const ic = overview.model?.information_coefficient;
-  setText('#kpi-last-label', 'Coef. de informação');
-  setText('#kpi-sharpe', ic?.mean == null ? '—' : nf(ic.mean, 3),
-    ic?.mean > 0 ? 'pos' : '');
-  setText('#kpi-last-sub', ic?.mean == null
-    ? 'sem modelo treinado'
-    : `t = ${nf(ic.t_stat, 1)} em ${ic.days} dias fora da amostra`);
-}
-
-/* -------------------------------------------------------------- the ML book */
-
-async function loadLabBook(overview) {
-  const [signals, status] = await Promise.all([
-    api('/lab/signals').catch(() => ({ rows: [] })),
-    api('/lab/status'),
-  ]);
-  state.lab = { overview, signals, status };
-  renderLabModel(overview, status);
-  renderLabFolds(overview.model);
-  renderLabRanking(signals, overview.model);
-
-  const toggle = $('#btn-lab-toggle');
-  toggle.textContent = status.running ? 'Parar' : 'Ligar';
-  toggle.className = `btn btn-small ${status.running ? 'btn-danger' : 'btn-primary'}`;
-}
-
-function renderLabModel(overview, status) {
-  const model = overview.model;
-  $('#lab-model-empty').hidden = Boolean(model);
-  $('#lab-model-cards').hidden = !model;
-  if (!model) { $('#lab-model-cards').innerHTML = ''; return; }
-
-  const ic = model.information_coefficient || {};
-  const cards = [
-    {
-      label: 'Vantagem mediana',
-      value: `${pct(model.median_edge)}/dia`,
-      tone: cls(model.median_edge),
-      note: `acima de segurar as 18 em partes iguais, em ${model.usable_folds} janelas`,
-    },
-    {
-      label: 'Janelas positivas',
-      value: `${model.positive_folds}/${model.usable_folds}`,
-      note: `${model.beat_baseline_folds} bateram a referência no total acumulado`,
-    },
-    {
-      label: 'Controle embaralhado',
-      value: model.null_edge == null ? '—' : `${pct(model.null_edge)}/dia`,
-      tone: model.null_edge < 0 ? 'pos' : 'neg',
-      note: 'mesmo teste com os resultados trocados entre as moedas do dia. '
-          + 'Perto de zero é o esperado; perto do número de cima significaria '
-          + 'que a vantagem nunca foi escolha de moeda.',
-    },
-    {
-      label: 'Giro médio',
-      value: `${nf(model.mean_turnover * 100, 1)}%/dia`,
-      note: `rebalanceia a cada ${model.rebalance_days} dias · cada troca completa `
-          + `custa ${nf(overview.cost_per_trade_pct, 2)}%`,
-    },
-    {
-      label: 'Capital em uso',
-      value: money(overview.capital_at_work, 0),
-      note: `de ${money(overview.start_capital, 0)} · cesta de ${model.top_k} a `
-          + `${money(overview.capital_at_work / model.top_k, 0)} cada · retorno `
-          + `sobre o que está em uso: ${pct(overview.return_on_capital_at_work_pct)}`,
-    },
-    {
-      label: 'Último ciclo',
-      value: status.last_day || '—',
-      note: status.last_rebalance
-        ? `último rebalanceamento em ${status.last_rebalance}`
-        : 'ainda não rebalanceou',
-    },
-  ];
-
-  if (!model.skill_is_coin_picking) {
-    cards.push({
-      label: 'Atenção', warn: true, value: 'controle não ficou atrás',
-      note: 'O teste com rótulos embaralhados foi tão bem quanto o modelo. '
-          + 'Isso significa que a vantagem medida não é escolha de moeda.',
-    });
-  }
-
-  $('#lab-model-cards').innerHTML = cards.map((card) => `
-    <div class="stat-card${card.warn ? ' warn' : ''}">
-      <span class="stat-label">${escape(card.label)}</span>
-      <strong class="stat-value ${card.tone || ''}">${escape(card.value)}</strong>
-      <span class="stat-note">${escape(card.note)}</span>
-    </div>`).join('');
-}
-
-function renderLabFolds(model) {
-  const body = $('#lab-cv-table tbody');
-  const folds = model?.folds || [];
-  body.innerHTML = folds.map((fold) => `
-    <tr>
-      <td>${escape(fold.test_from)} — ${escape(fold.test_to)}</td>
-      <td class="num">${fold.days}</td>
-      <td class="num">${nf(fold.turnover * 100, 1)}%</td>
-      <td class="num ${cls(fold.net_per_day)}">${pct(fold.net_per_day, 3)}</td>
-      <td class="num muted">${pct(fold.baseline_per_day, 3)}</td>
-      <td class="num ${cls(fold.edge)}">${pct(fold.edge, 3)}</td>
-      <td class="num ${Math.abs(fold.t_stat) > 2 ? cls(fold.t_stat) : 'muted'}">${nf(fold.t_stat, 2)}</td>
-      <td class="num ${cls(fold.total_pct)}">${pct(fold.total_pct, 1)}</td>
-      <td class="num muted">${pct(fold.baseline_total_pct, 1)}</td>
-    </tr>`).join('');
-  $('#lab-cv-note').textContent = model
-    ? `${model.total_trade_days} dias fora da amostra · t mediano ${nf(model.median_t_stat, 2)}`
-      + ` (acima de 2 seria significativo)`
-    : '—';
-}
-
-function renderLabRanking(signals, model) {
-  const rows = signals.rows || [];
-  $('#lab-rank-empty').hidden = rows.length > 0;
-  $('#lab-rank-table').hidden = rows.length === 0;
-  $('#lab-rank-note').textContent = rows.length
-    ? `${signals.day} · a cesta são os ${signals.top_k} primeiros`
-    : (signals.error || '—');
-  $('#lab-rank-table tbody').innerHTML = rows.map((row) => `
-    <tr${row.wanted ? ' class="row-on"' : ''}>
-      <td class="num">${row.rank}</td>
-      <td><strong>${escape(row.symbol)}</strong></td>
-      <td class="num">${nf(row.probability, 3)}</td>
-      <td class="num">${nf(row.close, row.close < 1 ? 4 : 2)}</td>
-      <td class="num ${cls(row.ret_7)}">${row.ret_7 == null ? '—' : pct(row.ret_7, 1)}</td>
-      <td class="num muted">${row.rsi_14 == null ? '—' : nf(row.rsi_14, 0)}</td>
-      <td class="num muted">${row.funding_bp == null ? '—' : nf(row.funding_bp, 2)}</td>
-      <td>${row.wanted ? '<span class="chip ok">na cesta</span>' : ''}</td>
-    </tr>`).join('');
-}
-
-/* The panel that answers "why has nothing happened". A book of seventeen
-   allocations is silent most of the time, and silence from a working bot and
-   silence from a broken one look identical unless the interface shows the
-   number each strategy is watching and how far it is from the line. */
-async function loadSignals() {
-  const { rows } = await api('/signals');
-  const body = $('#signals-table tbody');
-  $('#signals-empty').hidden = rows.length > 0;
-  $('#signals-table').hidden = rows.length === 0;
-
-  const ready = rows.filter((r) => r.trigger && r.trigger.met).length;
-  const holding = rows.filter((r) => r.holding).length;
-  setText('#signals-summary', rows.length
-    ? `${plural(rows.length, 'alocação', 'alocações')} · ${holding} comprada${holding === 1 ? '' : 's'}`
-      + ` · ${ready} com o gatilho atendido`
-    : '—');
-
-  body.innerHTML = rows.map((row) => {
-    if (!row.trigger) {
-      return `<tr><td class="mono">${esc(row.symbol || '—')}</td>
-        <td class="muted" colspan="7">${esc(row.error || 'sem gatilho declarado')}</td></tr>`;
+  /* Scaled across every year, not within the chosen one, so switching years
+     compares like with like instead of re-normalising each to its own best
+     month. */
+  const scale = Math.max(...all.map((m) => Math.abs(m.pnl))) || 1;
+  setHTML('#monthly-list', slots.map((m) => {
+    if (m.empty) {
+      return `
+      <div class="mcol is-empty" title="${monthName(m.month)} · sem operações encerradas">
+        <span class="mcol-value muted">—</span>
+        <span class="mcol-plot"><span class="mcol-half up"></span><span class="mcol-half down"></span></span>
+        <span class="mcol-name">${monthName(m.month)}</span>
+      </div>`;
     }
-    const t = row.trigger;
-    const distance = t.distance_pct == null ? num(t.gap) : `${signed(t.distance_pct, 1)}%`;
+    const height = Math.max(Math.abs(m.pnl) / scale * 100, 1.5);
+    const up = m.pnl >= 0;
     return `
-    <tr>
-      <td class="mono">${esc(row.symbol)} <span class="muted">${esc(row.interval)}</span></td>
-      <td class="muted">${esc(row.strategy_label)}</td>
-      <td>${row.holding
-        ? '<span class="chip warn">saída</span>'
-        : '<span class="chip">entrada</span>'}
-        <span class="muted">${esc(triggerText(t))}</span></td>
-      <td class="num mono">${num(t.left_value)}</td>
-      <td class="num mono">${num(t.right_value)}</td>
-      <td class="num ${t.met ? 'pos' : 'muted'}">${distance}</td>
-      <td class="num mono">${triggerPrice(row)}</td>
-      <td>${t.met ? '<span class="chip ok">atendido</span>' : ''}</td>
-    </tr>`;
-  }).join('');
+    <div class="mcol" title="${monthName(m.month)} · ${signed(m.pnl)} · ${m.trades} operações · acerto ${nf(m.win_rate_pct, 0)}%">
+      <span class="mcol-value ${cls(m.pnl)}">${signed(m.pnl, 0)}</span>
+      <span class="mcol-plot">
+        <span class="mcol-half up">${up
+          ? `<i class="mcol-bar pos" style="height:${height}%"></i>` : ''}</span>
+        <span class="mcol-half down">${up
+          ? '' : `<i class="mcol-bar neg" style="height:${height}%"></i>`}</span>
+      </span>
+      <span class="mcol-name">${monthName(m.month)}</span>
+    </div>`;
+  }).join(''));
+
+  const traded = slots.filter((m) => !m.empty);
+  const total = traded.reduce((sum, m) => sum + m.pnl, 0);
+  const up = traded.filter((m) => m.pnl > 0).length;
+  setText('#monthly-summary', traded.length
+    ? `${year}: ${signed(total)} em ${traded.length} ${traded.length === 1 ? 'mês' : 'meses'}`
+      + ` · ${up} ${up === 1 ? 'positivo' : 'positivos'}`
+    : `${year}: nenhuma operação encerrada`);
 }
 
-/* The same trigger in the unit that is actually on the screen a trader is
-   watching. "ROC 40 abaixo de 0" is exact and unwatchable; "vira em 1.4960"
-   is the same fact as a line on the chart.
+/* Delegated from the container, which outlives the buttons: they are rebuilt
+   whenever the data changes, and a listener bound to a button dies with the
+   node that carried it. */
+document.addEventListener('click', (event) => {
+  const button = event.target.closest('#monthly-years [data-year]');
+  if (!button || button.dataset.year === state.monthlyYear) return;
+  state.monthlyYear = button.dataset.year;
+  if (state.monthlyData) renderMonthly(state.monthlyData);
+});
 
-   It is a level for the next close, not a standing order: the indicator's
-   reference bars roll forward every candle, so the level moves on its own even
-   if the price does not. */
-function triggerPrice(row) {
-  const level = row.trigger_price;
-  if (level == null) return '<span class="muted">—</span>';
-  const move = row.price ? (level / row.price - 1) * 100 : null;
-  return `${num(level)} <span class="muted">${move == null ? '' : signed(move, 1) + '%'}</span>`;
-}
-
-/* "RSI 14 abaixo de 25" - the comparison in words, so the two numbers beside
-   it do not have to be read against an operator symbol. */
-function triggerText(trigger) {
-  const OP = { '>': 'acima de', '>=': 'pelo menos', '<': 'abaixo de', '<=': 'no máximo' };
-  const left = indicatorText(trigger.left);
-  const right = trigger.right ? indicatorText(trigger.right) : num(trigger.right_value);
-  return `${left} ${OP[trigger.operator] || trigger.operator} ${right}`;
-}
-
-/* The decision itself, on one line, above the full indicator list. */
-function triggerBox(trigger) {
-  if (!trigger) return '';
-  return `<p class="sigtrigger ${trigger.met ? 'is-met' : ''}">
-    <span class="sigtrigger-label">${esc(triggerText(trigger))}</span>
-    <span class="sigtrigger-nums mono">${num(trigger.left_value)}
-      <span class="muted">vs</span> ${num(trigger.right_value)}</span>
-  </p>`;
-}
-
-/* The waterfall exists because a single "resultado total" number hides the two
-   things that make it, and they are not the same kind of money: one is banked
-   and one can still evaporate. Reading it top to bottom gives the whole
-   arithmetic - what was put in, what closed trades did to it, what open trades
-   are currently doing to it, and what is left. */
-const MODE_TEXT = {
-  live: 'CONTA REAL — dinheiro de verdade',
-  paper: 'papel — nenhuma ordem sai daqui',
-  testnet: 'conta de teste (testnet) — dinheiro fictício',
+const MONTHS_PT = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun',
+                   'jul', 'ago', 'set', 'out', 'nov', 'dez'];
+const monthName = (key) => {
+  const [year, month] = key.split('-');
+  return `${MONTHS_PT[Number(month) - 1] || month}/${year.slice(2)}`;
 };
 
-function renderPnl(overview) {
-  setText('#pnl-mode', MODE_TEXT[overview.mode] || MODE_TEXT.testnet);
-  $('#pnl-mode').className = overview.mode === 'live' ? 'neg' : 'muted';
-
-  const rows = [
-    { label: 'Capital inicial', tone: '',
-      sub: overview.capital_at_work
-        ? `ponto de partida · ${money(overview.capital_at_work, 0)} podem estar aplicados de cada vez`
-        : 'ponto de partida',
-      value: money(overview.start_capital) },
-    { label: 'Resultado realizado', tone: cls(overview.realised_pnl),
-      sub: `${plural(overview.closed_trades, 'operação encerrada', 'operações encerradas')} · ${overview.wins}G / ${overview.losses}P`,
-      value: signed(overview.realised_pnl) },
-    { label: 'Resultado em aberto', tone: cls(overview.unrealised_pnl),
-      sub: `${plural(overview.open_positions, 'posição', 'posições')} · ${money(overview.invested)} aplicados`,
-      value: signed(overview.unrealised_pnl) },
-    { label: 'Patrimônio agora', tone: cls(overview.total_pnl), total: true,
-      sub: `${pct(overview.total_return_pct)} sobre o capital inicial`,
-      value: money(overview.total_value) },
-  ];
-  $('#pnl-waterfall').innerHTML = rows.map((r) => `
-    <div class="wf-row${r.total ? ' wf-total' : ''}">
-      <div class="wf-text">
-        <span class="wf-label">${r.label}</span>
-        <span class="wf-sub">${r.sub}</span>
-      </div>
-      <strong class="wf-value ${r.tone}">${r.value}</strong>
-    </div>`).join('')
-    + `<p class="wf-note">Todos os valores já descontam taxas e escorregamento.
-       ${feeNote(overview)}</p>`;
+/* The same grouped view the Operações tab draws, capped and scrolled from
+   inside. A trade history only grows, and a panel that grows with it pushes
+   everything under it off the screen a little further every week. */
+async function loadPanelTrades() {
+  const box = $('#panel-trades');
+  const groups = groupBySymbol((await api('/trades?limit=200')).map(normaliseLive));
+  const total = groups.reduce((sum, g) => sum + g.trades.length, 0);
+  $('#panel-trades-empty').hidden = total > 0;
+  setText('#panel-trades-count',
+    `${total} ${total === 1 ? 'operação' : 'operações'} · ${groups.length} moedas`);
+  if (!setHTML(box, groups.map((g, i) => tradeGroup(g, i, 'p')).join(''))) return;
+  bindTradeRows(box);
 }
 
-/* The testnet charges nothing, so "estimated fees" there is a number the
-   account never paid. Saying which of the two is being shown matters more than
-   the number: the estimate is what a real account would have cost, and telling
-   the operator that is the whole point of showing it before going live. */
-function feeNote(overview) {
-  if (overview.mode === 'paper') {
-    return `Livro em papel: nada é enviado à corretora. Cada operação já desconta`
-      + ` ${nf(overview.cost_per_trade_pct, 2)}% de ida e volta — taxa mais`
-      + ` escorregamento, a mesma conta que o livro ao vivo usa.`;
-  }
-  const measured = overview.fees_measured_orders || 0;
-  const total = overview.fees_total_orders || 0;
-  const turnover = money(overview.turnover);
-  if (measured && overview.fees_charged > 0) {
-    return `Taxas cobradas: ${money(overview.fees_charged, 4)} sobre ${turnover}`
-      + ` negociados${measured < total
-        ? ` (${measured} de ${total} ordens com taxa medida)` : ''}.`;
-  }
-  if (measured) {
-    return `A corretora não cobrou taxa em nenhuma das ${measured} ordens medidas`
-      + ` — normal na testnet. Numa conta real as mesmas ${turnover} negociados`
-      + ` custariam cerca de ${money(overview.fees_estimate)}.`;
-  }
-  return `Taxas estimadas até agora: ${money(overview.fees_estimate)} sobre`
-    + ` ${turnover} negociados.`;
+/* Shared with the Operações tab: one expander, two places that draw it. */
+function bindTradeRows(box) {
+  $$('.trade-row', box).forEach((row) => row.addEventListener('click', () => {
+    const detail = $(`#${row.dataset.detail}`, box);
+    detail.hidden = !detail.hidden;
+    row.classList.toggle('is-open', !detail.hidden);
+    setHTML($('td.expander', row), detail.hidden ? '&#9656;' : '&#9662;');
+  }));
 }
 
 function renderEquity(rows, overview) {
@@ -803,7 +481,7 @@ function renderPositions(positions) {
   const body = $('#positions-table tbody');
   $('#positions-empty').hidden = positions.length > 0;
   $('#positions-table').style.display = positions.length ? '' : 'none';
-  body.innerHTML = positions.map((p) => `
+  setHTML(body, positions.map((p) => `
     <tr>
       <td class="sym">${p.symbol}</td>
       <td>${p.strategy
@@ -814,15 +492,15 @@ function renderPositions(positions) {
       <td class="num">${nf(p.mark_price, 4)}</td>
       <td class="num">${money(p.value)}</td>
       <td class="num ${cls(p.unrealised_pnl)}">${signed(p.unrealised_pnl)} <span class="muted">${pct(p.unrealised_pct)}</span></td>
-    </tr>`).join('');
+    </tr>`).join(''));
 }
 
 function renderBreakdown(rows) {
   const box = $('#breakdown-list');
   $('#breakdown-empty').hidden = rows.length > 0;
-  if (!rows.length) { box.innerHTML = ''; return; }
+  if (!rows.length) { setHTML(box, ''); return; }
   const scale = Math.max(...rows.map((r) => Math.abs(r.pnl))) || 1;
-  box.innerHTML = rows.map((r) => `
+  setHTML(box, rows.map((r) => `
     <div class="bar-row">
       <span class="bar-name">${r.name}</span>
       <span class="bar-value ${cls(r.pnl)}">${signed(r.pnl)}</span>
@@ -831,33 +509,13 @@ function renderBreakdown(rows) {
              style="left:0;width:${Math.abs(r.pnl) / scale * 100}%"></div>
       </div>
       <span class="bar-meta">${r.trades} ops · acerto ${nf(r.win_rate_pct, 0)}% · média ${pct(r.avg_return_pct)}</span>
-    </div>`).join('');
+    </div>`).join(''));
 }
 
 // Event messages carry exception text, which can contain anything.
 function escape(value) {
   return String(value).replace(/[&<>"]/g,
     (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
-}
-
-function renderEvents(events, target = '#events-list') {
-  $(target).innerHTML = events.length
-    ? events.map((e) => {
-      // A collapsed row covers a span, so show where it started as well as the
-      // count - "120x" without "since 01:40" says nothing about the outage.
-      const repeats = e.repeats > 1
-        ? `<span class="repeats" title="primeira em ${dt(e.first_ts)}">${e.repeats}x</span>`
-        : '';
-      const since = e.repeats > 1 && e.first_ts
-        ? `<span class="muted">desde ${dt(e.first_ts)}</span>` : '';
-      return `
-      <li>
-        <time>${dt(e.ts)}</time>
-        <span class="level ${e.level}">${e.level}</span>
-        <span>${escape(e.message)} ${repeats} ${since}</span>
-      </li>`;
-    }).join('')
-    : '<li><span class="muted">Sem atividade ainda.</span></li>';
 }
 
 /* --------------------------------------------------------------------- lab */
@@ -867,13 +525,29 @@ async function loadLab() {
   const rows = await api(`/research/leaderboard?limit=50&only_validated=${onlyValidated}`);
   state.leaderboard = rows;
   renderLeaderboard(rows);
-  const status = await api('/research/status');
+  const [status, runs] = await Promise.all([
+    api('/research/status'), api('/research/runs?limit=50'),
+  ]);
   renderResearchProgress(status);
-  const [feeds, headlines] = await Promise.all([
-    api('/feeds'), api('/feeds/headlines?limit=12'),
+  renderSweepState(status, runs);
+  const [feeds, procs, catalog, config, risk] = await Promise.all([
+    api('/feeds'), api('/processes'), api('/strategies'),
+    api('/bot/config'), api('/risk'),
   ]);
   renderFeeds(feeds);
-  renderHeadlines(headlines);
+  renderProcesses(procs);
+  renderBot(procs, config);
+  renderRisk(risk);
+  renderAllocations(config);
+  /* Last on the page, and deliberately: it is reference material about what
+     exists to be chosen, not a control. Someone reaches for it once, when a
+     name in the ranking above means nothing to them. */
+  setHTML('#catalog-list', catalog.map((c) => `
+    <div class="catalog-card">
+      <strong>${c.label}</strong>
+      <span class="family">${c.family} · ${c.grid_size} combinações</span>
+      <p>${c.description}</p>
+    </div>`).join(''));
 }
 
 // Series whose past can be downloaded are already researchable; the rest are
@@ -891,9 +565,12 @@ function renderFeeds(data) {
   const chip = $('#feeds-state');
   chip.textContent = data.running ? 'coletando' : 'parado';
   chip.className = `chip ${data.running ? 'ok' : 'warn'}`;
+  state.feeds = data;
+
+  renderCollectProgress(data.progress || {}, [...data.feeds, data.news]);
 
   const rows = [...data.feeds, data.news];
-  $('#feeds-list').innerHTML = rows.map((row) => {
+  setHTML('#feeds-list', rows.map((row) => {
     const [name, note] = FEED_LABELS[row.feed] || [row.feed, ''];
     const status = row.status || {};
     // A feed that has never failed shows nothing; one that has shows the error,
@@ -912,32 +589,50 @@ function renderFeeds(data) {
         <span class="muted">visto ${dt(status.last_run)}</span>
       </div>
     </div>`;
-  }).join('');
+  }).join(''));
 }
 
-function renderHeadlines(rows) {
-  $('#feeds-headlines').innerHTML = rows.length
-    ? rows.map((row) => {
-      // Both timestamps are shown on purpose. When they disagree by hours, the
-      // reason not to train on the publisher's one is visible rather than
-      // asserted.
-      const lag = row.published_at
-        ? `<span class="muted" title="hora declarada pela fonte">publicado ${dt(row.published_at)}</span>` : '';
-      return `
-      <li>
-        <time>${dt(row.observed_at)}</time>
-        <span class="src">${escape(row.source)}</span>
-        <span>${escape(row.title)} ${lag}</span>
-      </li>`;
-    }).join('')
-    : '<li><span class="muted">Nenhuma manchete coletada ainda.</span></li>';
+/* How far the collection has got, as a share of the year it needs.
+   
+   Measured from the first row this process ever wrote, never from the oldest
+   timestamp in the data: funding backfills to 2020 and Fear and Greed to 2018,
+   so a `source_ts` reading would report the dataset as finished on the day it
+   was installed. What the walk-forward can use is only what was observed
+   forward, and that clock started when the collector did. */
+function renderCollectProgress(progress, rows) {
+  const pct = progress.pct || 0;
+  $('#collect-bar').style.width = `${pct}%`;
+  setText('#collect-pct', `${nf(pct, 1)}% do primeiro ano`);
+  setText('#collect-detail', progress.started_at
+    ? `${nf(progress.days, 0)} de ${progress.target_days} dias`
+      + ` · faltam ${nf(progress.days_left, 0)}`
+      + ` · desde ${dt(progress.started_at, false)}`
+    : 'nada coletado ainda');
+
+  const forward = rows.filter((r) => r.first_seen);
+  const failing = rows.filter((r) => r.status && r.status.last_error).length;
+  setHTML('#collect-stats', [
+    ['Linhas guardadas', (progress.rows || 0).toLocaleString('pt-BR'),
+      `${forward.length} de ${rows.length} fontes ativas`],
+    ['Dias corridos', nf(progress.days || 0, 0),
+      `alvo ${progress.target_days || 365}`],
+    ['Manchetes', ((rows.find((r) => r.feed === 'headlines') || {}).rows || 0)
+      .toLocaleString('pt-BR'), 'pontuadas pelo FinBERT'],
+    ['Fontes com falha', String(failing),
+      failing ? 'veja o detalhe abaixo' : 'nenhuma agora'],
+  ].map(([label, value, note]) => `
+    <div class="sweep-stat">
+      <span class="sweep-stat-label">${label}</span>
+      <strong class="sweep-stat-value">${value}</strong>
+      <span class="sweep-stat-note">${note}</span>
+    </div>`).join(''));
 }
 
 function renderLeaderboard(rows) {
   const body = $('#leaderboard-table tbody');
   $('#leaderboard-empty').hidden = rows.length > 0;
   $('#leaderboard-table').style.display = rows.length ? '' : 'none';
-  body.innerHTML = rows.map((row) => {
+  const wrote = setHTML(body, rows.map((row) => {
     const test = row.test;
     const beats = test.total_return_pct > test.buy_hold_return_pct;
     return `
@@ -956,8 +651,9 @@ function renderLeaderboard(rows) {
         ? '<span class="chip ok">aprovada</span>'
         : `<span class="chip ${beats ? 'warn' : 'bad'}">${beats ? 'parcial' : 'reprovada'}</span>`}</td>
     </tr>`;
-  }).join('');
+  }).join(''));
 
+  if (!wrote) return;
   $$('#leaderboard-table tbody tr').forEach((tr) => {
     tr.addEventListener('click', (event) => {
       const id = Number(tr.dataset.id);
@@ -992,8 +688,8 @@ async function showDetail(id) {
     ['Consistência OOS', `${nf(row.test.consistency_pct, 0)}%`, ''],
     ['Risco', riskText(row.risk), ''],
   ];
-  $('#detail-metrics').innerHTML = cards.map(([label, value, klass]) =>
-    `<div class="detail-item"><span>${label}</span><strong class="${klass}">${value}</strong></div>`).join('');
+  setHTML('#detail-metrics', cards.map(([label, value, klass]) =>
+    `<div class="detail-item"><span>${label}</span><strong class="${klass}">${value}</strong></div>`).join(''));
 
   const points = row.curve.map((p) => ({ t: p.time, y: p.equity }));
   drawChart($('#detail-chart'), [{
@@ -1008,6 +704,60 @@ function riskText(risk) {
   if (risk.take_pct) parts.push(`alvo ${(risk.take_pct * 100).toFixed(0)}%`);
   if (risk.trail_pct) parts.push(`trailing ${(risk.trail_pct * 100).toFixed(0)}%`);
   return parts.join(' · ') || 'só sinal';
+}
+
+/* What the search has already spent, before offering to spend more.
+   
+   A leaderboard is a list of survivors, and survivors of a large search are
+   partly survivors of luck: 13 strategies over hundreds of parameter sets on
+   dozens of symbols will clear every gate by chance somewhere. The out-of-
+   sample split, the buy-and-hold comparison and the consistency gate each push
+   that rate down, and none of them drive it to zero.
+   
+   So the running total of candidates tested is shown as the headline figure of
+   this tab. It is the denominator nobody keeps in their head, and it is the
+   one number that makes "approved" mean less each time the button is pressed. */
+function renderSweepState(status, runs) {
+  const chip = $('#sweep-state');
+  const done = (runs || []).filter((r) => r.status === 'done');
+  const tested = (runs || []).reduce((sum, r) => sum + (r.total || 0), 0);
+
+  if (!status) {
+    chip.textContent = 'nunca rodou';
+    chip.className = 'chip';
+    setHTML('#sweep-stats', '');
+    setText('#sweep-note', 'Nenhuma varredura ainda. O ranking abaixo está vazio'
+      + ' até a primeira rodar.');
+    $('#sweep-form').open = true;
+    return;
+  }
+
+  const running = status.status === 'running';
+  chip.textContent = running ? 'rodando' : (status.status === 'done' ? 'concluída' : status.status);
+  chip.className = `chip ${running ? 'warn' : (status.status === 'done' ? 'ok' : '')}`;
+
+  const config = status.config || {};
+  const symbols = (config.symbols || []).length;
+  const intervals = (config.intervals || []).join(', ') || '—';
+  setHTML('#sweep-stats', [
+    ['Candidatos testados', tested.toLocaleString('pt-BR'), 'somando todas as varreduras'],
+    ['Varreduras', String(done.length), 'concluídas até agora'],
+    ['Última', status.finished_at ? dt(status.finished_at) : dt(status.created_at),
+      `${symbols} ${symbols === 1 ? 'par' : 'pares'} · ${intervals}`],
+    ['Resultados guardados', String(status.results ?? 0), 'na última varredura'],
+  ].map(([label, value, note]) => `
+    <div class="sweep-stat">
+      <span class="sweep-stat-label">${label}</span>
+      <strong class="sweep-stat-value">${value}</strong>
+      <span class="sweep-stat-note">${note}</span>
+    </div>`).join(''));
+
+  setText('#sweep-note', tested
+    ? `${tested.toLocaleString('pt-BR')} candidatos já foram testados nesta base.`
+      + ' Cada varredura nova amplia esse número, e com ele a chance de uma'
+      + ' aprovada ter passado por sorte — é por isso que a decisão final é a'
+      + ' caminhada para a frente na aba Validação, não este ranking.'
+    : 'Nenhum candidato testado ainda.');
 }
 
 function renderResearchProgress(status) {
@@ -1191,6 +941,23 @@ function triggerLine(signal) {
     ? ` · ${late} ${late === 1 ? 'candle' : 'candles'} antes da ordem` : ''}</p>`;
 }
 
+function triggerText(trigger) {
+  const OP = { '>': 'acima de', '>=': 'pelo menos', '<': 'abaixo de', '<=': 'no máximo' };
+  const left = indicatorText(trigger.left);
+  const right = trigger.right ? indicatorText(trigger.right) : num(trigger.right_value);
+  return `${left} ${OP[trigger.operator] || trigger.operator} ${right}`;
+}
+
+/* The decision itself, on one line, above the full indicator list. */
+function triggerBox(trigger) {
+  if (!trigger) return '';
+  return `<p class="sigtrigger ${trigger.met ? 'is-met' : ''}">
+    <span class="sigtrigger-label">${esc(triggerText(trigger))}</span>
+    <span class="sigtrigger-nums mono">${num(trigger.left_value)}
+      <span class="muted">vs</span> ${num(trigger.right_value)}</span>
+  </p>`;
+}
+
 function sideCard(title, rule, values, price, time, signal) {
   return `
     <div class="sigcard">
@@ -1241,7 +1008,7 @@ function tradeRow(trade, key) {
     </tr>`;
 }
 
-function tradeGroup(group, index) {
+function tradeGroup(group, index, scope = 't') {
   const trades = group.trades;
   const closed = trades.filter((t) => t.exit_time);
   const wins = closed.filter((t) => t.pnl > 0).length;
@@ -1272,7 +1039,7 @@ function tradeGroup(group, index) {
                 <th class="num">Resultado</th><th class="num">%</th>
                 <th class="num">Sinal de compra</th><th>Motivo da saída</th></tr>
           </thead>
-          <tbody>${trades.map((t, i) => tradeRow(t, `d-${index}-${i}`)).join('')}</tbody>
+          <tbody>${trades.map((t, i) => tradeRow(t, `${scope}-${index}-${i}`)).join('')}</tbody>
         </table>
       </div>
     </div>`;
@@ -1311,78 +1078,143 @@ function groupBySymbol(rows) {
    doing"; the panel above it already does that. This one answers "what did the
    robot do, in order", which is the question a statement answers, and a
    statement that reorders itself is not a statement. */
-async function loadLedger() {
-  const { orders, totals } = await api('/orders?limit=200');
-  const body = $('#ledger-table tbody');
+/* ------------------------------------------------------------- processes */
 
-  $('#ledger-count').textContent = totals.orders
-    ? `${plural(totals.orders, 'ordem', 'ordens')} · ${plural(totals.buys, 'compra', 'compras')} · ${plural(totals.sells, 'venda', 'vendas')}`
-    : '—';
-  $('#ledger-empty').hidden = totals.orders > 0;
-  $('#ledger-table').hidden = totals.orders === 0;
+/* Every loop that wakes on a clock, with its switch next to it. They used to
+   be scattered - the robot in the header, the lab inside its own book, market
+   collection in the research tab - so no single screen could answer what was
+   actually running. `enabled` and `running` are reported separately on purpose:
+   a process can be switched on and still be down, and the two cases need
+   different responses from whoever is reading. */
+/* The robot, on its own card and with its own form.
 
-  const cards = [
-    ['Saiu do caixa', money(totals.spent), 'total das compras'],
-    ['Voltou ao caixa', money(totals.received), 'total das vendas'],
-    ['Resultado realizado', money(totals.realised_pnl), 'só de posições encerradas',
-      cls(totals.realised_pnl)],
-    (totals.fees_measured_orders && totals.fees_charged > 0
-      ? ['Taxas cobradas', money(totals.fees_charged, 4), 'medidas na corretora']
-      : ['Taxas estimadas', money(totals.fees_estimate),
-        totals.fees_measured_orders ? 'testnet não cobrou nada' : '0,1% por ordem']),
-  ];
-  $('#ledger-totals').innerHTML = cards.map(([label, value, sub, tone]) => `
-    <div class="ltot">
-      <span class="ltot-label">${label}</span>
-      <strong class="ltot-value ${tone || ''}">${value}</strong>
-      <span class="ltot-sub">${sub}</span>
-    </div>`).join('');
+   Separate from the collectors because it is the only one that moves money:
+   its switch needs to say how much per order, in what mode, against what
+   ceiling, and a collector's switch needs none of that.
 
-  body.innerHTML = orders.map((row) => `
-    <tr>
-      <td>${dt(row.ts)}</td>
-      <td><span class="side ${row.is_buy ? 'buy' : 'sell'}">${row.is_buy ? 'COMPRA' : 'VENDA'}</span></td>
-      <td class="mono">${esc(row.symbol)}</td>
-      <td class="muted">${esc(row.strategy_label)}</td>
-      <td class="num mono">${num(row.qty)}</td>
-      <td class="num mono">${num(row.price)}</td>
-      <td class="num">${money(row.quote)}</td>
-      <td class="num ${cls(row.cash_delta)}">${signed(row.cash_delta)}</td>
-      <td class="num ${cls(row.pnl)}">${row.pnl == null ? '—'
-        : `${signed(row.pnl)} <span class="muted">${pct(row.return_pct)}</span>`}</td>
-      <td class="muted">${row.is_buy ? 'entrada' : esc(ruleText(row.note))}${row.duration_seconds
-        ? ` · ${dur(row.duration_seconds)}` : ''}</td>
-    </tr>`).join('');
+   The form itself is static markup and is never redrawn. It sits inside a
+   panel the fifteen-second poll rewrites, and a field rebuilt under someone's
+   fingers throws away what they were typing. Only the values are pushed in,
+   and only into fields that are not focused. */
+function renderBot(data, config) {
+  const bot = (data.processes || []).find((row) => row.key === 'bot');
+  if (!bot) return;
+
+  const chip = $('#bot-state');
+  chip.textContent = bot.running ? 'rodando' : (bot.enabled ? 'ligado, parado' : 'desligado');
+  chip.className = `chip ${bot.running ? 'ok' : (bot.enabled ? 'warn' : '')}`;
+
+  const toggle = $('#btn-toggle-bot');
+  toggle.textContent = bot.running ? 'Desligar' : 'Ligar';
+  toggle.className = `btn btn-small ${bot.running ? 'btn-danger' : 'btn-primary'}`;
+  toggle.disabled = Boolean(bot.blocked) && !bot.running;
+  $('#bot-blocked').hidden = !bot.blocked;
+  $('#bot-blocked').textContent = bot.blocked || '';
+
+  /* The money facts, readable without opening the form. How much leaves the
+     account per order is not a setting to go looking for. */
+  const live = config.mode !== 'paper' && state.status?.exchange?.testnet === false;
+  setHTML('#bot-summary', [
+    [config.mode === 'paper' ? 'papel' : (live ? 'CONTA REAL' : 'testnet'),
+     'modo', live ? 'neg' : ''],
+    [money(config.quote_per_trade, 0), 'por operação', ''],
+    [String(config.max_positions), 'posições no máximo', ''],
+    [money(config.quote_per_trade * config.max_positions, 0), 'comprometido no teto', ''],
+    [`${config.poll_seconds}s`, 'entre ciclos', ''],
+  ].map(([value, label, tone]) => `
+    <span class="botfact">
+      <b class="${tone}">${value}</b><span class="muted">${label}</span>
+    </span>`).join(''));
+
+  /* Values in, but never over a field being edited. */
+  const fill = (sel, value) => {
+    const el = $(sel);
+    if (el && el !== document.activeElement) el.value = value;
+  };
+  fill('#in-mode', config.mode);
+  fill('#in-poll', config.poll_seconds);
+  fill('#in-quote', config.quote_per_trade);
+  fill('#in-maxpos', config.max_positions);
+  fill('#in-capital', config.start_capital);
 }
 
-async function loadTrades() {
-  const mode = state.tradesMode;
-  const box = $('#trades-groups');
-  box.innerHTML = '<p class="muted">Carregando…</p>';
+function renderAllocations(config) {
+  const list = config.allocations || [];
+  $('#allocations-empty').hidden = list.length > 0;
+  setText('#allocations-count', list.length
+    ? `${list.length} ${list.length === 1 ? 'estratégia' : 'estratégias'}` : '—');
+  const wrote = setHTML('#allocations-list', list.map((a, index) => `
+    <div class="alloc">
+      <div class="alloc-main">
+        <strong>${a.symbol} · ${a.label || a.strategy}</strong>
+        <span>${a.interval} · ${paramText(a.params || {})} · ${riskText(a.risk || {})}</span>
+      </div>
+      <button class="btn btn-small btn-danger" data-drop="${index}">Remover</button>
+    </div>`).join(''));
 
-  let groups;
-  if (mode === 'live') {
-    $('#trades-hint').textContent = 'Operações reais do robô, agrupadas por moeda. '
-      + 'Clique em uma linha para ver os indicadores que dispararam a entrada e a saída.';
-    groups = groupBySymbol((await api('/trades?limit=200')).map(normaliseLive));
-  } else {
-    $('#trades-hint').textContent = 'As mesmas estratégias em operação, aplicadas ao histórico '
-      + 'recente, com o mesmo valor por ordem que o robô usa. Mostra como cada uma se '
-      + 'comporta — é simulação, não dinheiro ganho.';
-    groups = (await api('/trades/history')).filter((g) => !g.error);
-  }
-
-  const total = groups.reduce((sum, g) => sum + g.trades.length, 0);
-  $('#trades-empty').hidden = total > 0;
-  $('#trades-count').textContent = `${total} operações · ${groups.length} moedas`;
-  box.innerHTML = groups.map(tradeGroup).join('');
-
-  $$('.trade-row', box).forEach((row) => row.addEventListener('click', () => {
-    const detail = $(`#${row.dataset.detail}`, box);
-    detail.hidden = !detail.hidden;
-    row.classList.toggle('is-open', !detail.hidden);
-    $('td.expander', row).innerHTML = detail.hidden ? '&#9656;' : '&#9662;';
+  if (wrote) $$('[data-drop]').forEach((button) => button.addEventListener('click', async () => {
+    const next = list.filter((_, i) => i !== Number(button.dataset.drop));
+    await api('/bot/allocations', { method: 'POST', body: { allocations: next } });
+    toast('Estratégia removida');
+    loadLab();
   }));
+}
+
+/* The collectors. The robot is drawn above by renderBot; these two neither
+   trade nor need a form. */
+function renderProcesses(data) {
+  const rows = (data.processes || []).filter((row) => row.key !== 'bot');
+  state.processes = rows;
+  const on = rows.filter((row) => row.running).length;
+  setText('#processes-summary', `${on} de ${rows.length} rodando`);
+
+  const wrote = setHTML('#processes-list', rows.map((row) => {
+    const chip = row.running
+      ? '<span class="chip ok">rodando</span>'
+      : `<span class="chip ${row.enabled ? 'warn' : ''}">${
+          row.enabled ? 'ligado, parado' : 'desligado'}</span>`;
+    const tone = row.blocked ? 'is-blocked' : (row.running ? 'is-on' : 'is-off');
+    return `
+    <div class="proc ${tone}">
+      <div class="proc-main">
+        <span class="proc-name">${esc(row.label)} ${chip}</span>
+        <span class="proc-detail">${esc(row.detail)}</span>
+        ${row.blocked ? `<span class="proc-blocked">${esc(row.blocked)}</span>` : ''}
+      </div>
+      <span class="proc-every">a cada ${every(row.every_seconds)}</span>
+      <button class="btn btn-small ${row.running ? 'btn-danger' : 'btn-primary'}"
+              data-proc="${row.key}" ${row.blocked && !row.running ? 'disabled' : ''}>
+        ${row.running ? 'Desligar' : 'Ligar'}
+      </button>
+    </div>`;
+  }).join(''));
+  if (!wrote) return;
+
+  $$('[data-proc]').forEach((button) => button.addEventListener('click', async () => {
+    const row = state.processes.find((item) => item.key === button.dataset.proc);
+    if (!row) return;
+    /* Only the off direction asks, and only where off costs something that
+       cannot be bought back. Confirming a switch that is free to undo trains
+       people to click through the one that is not. */
+    if (row.running && row.warn_on_stop
+        && !confirm(`Desligar ${row.label}? ${row.warn_on_stop}`)) return;
+    try {
+      const result = await api(row.running ? row.stop : row.start, { method: 'POST' });
+      toast(result.message === 'no strategies allocated'
+        ? 'Nenhuma estratégia alocada'
+        : `${row.label}: ${row.running ? 'desligado' : 'ligado'}`, 'ok');
+      loadLab();
+    } catch (error) { toast(error.message, 'error'); }
+  }));
+}
+
+/* Cadences here span ten minutes to six hours, and "21600s" is a number the
+   reader has to do arithmetic on to understand. */
+function every(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
+  const hours = seconds / 3600;
+  return `${nf(hours, hours % 1 ? 1 : 0)} h`;
 }
 
 /* ---------------------------------------------------------------- settings */
@@ -1416,349 +1248,6 @@ function renderRisk(risk) {
   $('#risk-detail').textContent = parts.join(' ');
 }
 
-async function loadSettings() {
-  const [config, catalog, risk] = await Promise.all([
-    api('/bot/config'), api('/strategies'), api('/risk')]);
-  renderRisk(risk);
-  $('#in-mode').value = config.mode;
-  $('#in-poll').value = config.poll_seconds;
-  $('#in-quote').value = config.quote_per_trade;
-  $('#in-maxpos').value = config.max_positions;
-  $('#in-capital').value = config.start_capital;
-
-  const list = config.allocations || [];
-  $('#allocations-empty').hidden = list.length > 0;
-  $('#allocations-list').innerHTML = list.map((a, index) => `
-    <div class="alloc">
-      <div class="alloc-main">
-        <strong>${a.symbol} · ${a.label || a.strategy}</strong>
-        <span>${a.interval} · ${paramText(a.params || {})} · ${riskText(a.risk || {})}</span>
-      </div>
-      <button class="btn btn-small btn-danger" data-drop="${index}">Remover</button>
-    </div>`).join('');
-
-  $$('[data-drop]').forEach((button) => button.addEventListener('click', async () => {
-    const next = list.filter((_, i) => i !== Number(button.dataset.drop));
-    await api('/bot/allocations', { method: 'POST', body: { allocations: next } });
-    toast('Estratégia removida');
-    loadSettings();
-  }));
-
-  $('#catalog-list').innerHTML = catalog.map((c) => `
-    <div class="catalog-card">
-      <strong>${c.label}</strong>
-      <span class="family">${c.family} · ${c.grid_size} combinações</span>
-      <p>${c.description}</p>
-    </div>`).join('');
-}
-
-/* -------------------------------------------------------------- validation */
-
-/* A verdict is only useful if the reader can see what it was based on, so each
-   card carries its own per-window table rather than a single summary number. */
-const REGIME_TONE = { bull: 'pos', bear: 'neg', chop: 'muted' };
-
-function windowRow(w) {
-  const period = `${w.test_start.slice(0, 10)} a ${w.test_end.slice(0, 10)}`;
-  return `<tr>
-    <td class="mono">${period}</td>
-    <td class="${REGIME_TONE[w.regime] || ''}">${esc(w.regime_label || '—')}</td>
-    <td class="num ${cls(w.return_pct)}">${num(w.return_pct)}%</td>
-    <td class="num muted">${num(w.buy_hold_pct)}%</td>
-    <td class="num">${num(w.sharpe)}</td>
-    <td class="num neg">${num(w.max_drawdown_pct)}%</td>
-    <td class="num">${w.trades}</td>
-  </tr>`;
-}
-
-function validationCard(report, index) {
-  const tone = report.passes ? 'ok' : 'bad';
-  const windows = (report.windows || []).map(windowRow).join('');
-  const regimes = (report.regimes || []).map((r) => `
-    <span class="legend-item"><b class="${REGIME_TONE[r.regime] || ''}">${esc(r.label)}</b>
-      ${r.profitable_windows}/${r.windows} no lucro,
-      mediana ${num(r.median_return_pct)}%</span>`).join('');
-  const detail = windows ? `<table class="compact">
-      <thead><tr><th>Trimestre</th><th>Regime</th><th class="num">Retorno</th>
-      <th class="num">Comprar e segurar</th>
-      <th class="num">Sharpe</th><th class="num">Queda máx.</th><th class="num">Ops.</th></tr></thead>
-      <tbody>${windows}</tbody></table>
-      ${regimes ? `<div class="legend">${regimes}</div>` : ''}`
-    : '<p class="muted">Sem janelas suficientes.</p>';
-
-  return `<div class="vcard">
-    <div class="vcard-head" data-vtoggle="${index}">
-      <div>
-        <strong>${esc(report.symbol)}</strong>
-        <span class="muted">${esc(report.interval)} · ${esc(report.label || report.strategy)}</span>
-      </div>
-      <span class="chip ${tone}">${esc(report.verdict)}</span>
-      <span class="expander" id="vexp-${index}">▾</span>
-    </div>
-    <div class="vcard-stats">
-      <div><span class="muted">Trimestres no lucro</span><strong>${report.profitable_pct ?? 0}%</strong></div>
-      <div><span class="muted">Bateu comprar e segurar</span><strong>${report.beat_buy_hold_pct ?? 0}%</strong></div>
-      <div><span class="muted">Composto</span><strong class="${cls(report.compounded_return_pct)}">${num(report.compounded_return_pct)}%</strong></div>
-      <div><span class="muted">Mediana</span><strong class="${cls(report.median_return_pct)}">${num(report.median_return_pct)}%</strong></div>
-      <div><span class="muted">Pior trimestre</span><strong class="neg">${num(report.worst_window_pct)}%</strong></div>
-      <div><span class="muted">Operações</span><strong>${report.total_trades ?? 0}</strong></div>
-    </div>
-    <div class="vcard-detail" id="vdet-${index}" hidden>${detail}</div>
-  </div>`;
-}
-
-/* Coverage is reported per timeframe rather than as one number because a
-   missed daily close costs six times what a missed 4h close costs, and one
-   average would hide which of the two is actually being lost. */
-async function loadCoverage() {
-  const data = await api('/coverage');
-  setText('#coverage-summary', data.since
-    ? `${nf(data.coverage_pct, 1)}% dos fechamentos · ligado ${nf(data.uptime_pct, 1)}% do tempo`
-    : 'nenhum ciclo registrado ainda');
-  // Fechamentos perdidos nunca expiram, então a conta é cumulativa: um marco
-  // move o início da contagem quando a hospedagem muda. O que ficou de fora
-  // continua escrito aqui — uma porcentagem que esconde metade da própria
-  // história é pior que a porcentagem incômoda que ela substituiu.
-  const note = $('#coverage-note');
-  if (data.excluded) {
-    note.hidden = false;
-    note.innerHTML = `Contagem reiniciada em <b>${dt(data.baseline)}</b>:`
-      + ` ${plural(data.excluded.missed, 'fechamento perdido', 'fechamentos perdidos')}`
-      + ` de ${data.excluded.closes} antes dessa data ficaram fora da conta,`
-      + ` sob a hospedagem anterior.`;
-  } else if (note) {
-    note.hidden = true;
-  }
-  $('#coverage-table tbody').innerHTML = (data.intervals || []).map((row) => `
-    <tr>
-      <td class="mono">${row.interval}</td>
-      <td class="num">${row.closes}</td>
-      <td class="num">${row.covered}</td>
-      <td class="num ${row.missed ? 'neg' : ''}">${row.missed}</td>
-      <td class="num ${row.coverage_pct >= 90 ? 'pos' : 'neg'}">${nf(row.coverage_pct, 1)}%</td>
-      <td class="num">${row.median_delay_minutes === null ? '—'
-        : `${nf(row.median_delay_minutes, 0)} min`}</td>
-    </tr>`).join('');
-}
-
-/* Each row is one live trade against its own backtest twin. The comparison is
-   pairwise on purpose: pooling live results into an average would need dozens
-   of trades to say anything, while a twin comparison catches a timing or
-   pricing defect on the first one. */
-async function loadParity() {
-  const { trades, totals } = await api('/parity?limit=50');
-  const aside = totals.unscored
-    ? ` · ${plural(totals.unscored, 'operação anterior', 'operações anteriores')}`
-      + ' à guarda, fora da conta'
-    : '';
-  setText('#parity-summary', (totals.evaluated
-    ? `${totals.matched} de ${totals.evaluated} conferem`
-      + (totals.median_entry_slippage_bps === null ? ''
-        : ` · escorregamento mediano ${nf(totals.median_entry_slippage_bps, 0)} bps`
-          + ` (tolerância ${nf(totals.tolerance_bps, 0)})`)
-    : 'nenhuma operação pontuada ainda') + aside);
-  $('#parity-empty').hidden = trades.length > 0;
-  $('#parity-table').hidden = trades.length === 0;
-  $('#parity-table tbody').innerHTML = trades.map((row) => {
-    const good = row.verdict === 'igual ao modelo';
-    // A trade the engine is no longer judged on is grey, not red: it is history,
-    // not a failing check.
-    const mark = row.scored === false ? '' : (good ? 'ok' : 'bad');
-    const slip = row.entry_slippage_bps;
-    return `
-    <tr>
-      <td class="mono">${row.symbol} <span class="muted">${row.interval || ''}</span></td>
-      <td>${dt(row.entry_time)}${row.entry_bars_late
-        ? ` <span class="muted">(${plural(row.entry_bars_late, 'vela', 'velas')} depois)</span>` : ''}</td>
-      <td class="num mono">${row.actual_entry_price === undefined ? '—' : nf(row.actual_entry_price, 4)}</td>
-      <td class="num mono">${row.expected_entry_price === undefined || row.expected_entry_price === null
-        ? '—' : nf(row.expected_entry_price, 4)}</td>
-      <td class="num ${slip === undefined ? '' : cls(-slip)}">${slip === undefined
-        ? '—' : `${signed(slip, 0)} bps`}</td>
-      <td class="num ${cls(row.actual_return_pct)}">${row.actual_return_pct === null
-        ? '<span class="muted">aberta</span>' : pct(row.actual_return_pct)}</td>
-      <td class="num ${cls(row.expected_return_pct)}">${row.expected_return_pct === undefined
-        ? '—' : pct(row.expected_return_pct)}</td>
-      <td><span class="chip ${mark}">${row.verdict}</span></td>
-    </tr>`;
-  }).join('');
-}
-
-/* The go-live checklist. Deliberately a list of gates and not a score: a score
-   averages away the one missing thing, and the one missing thing is exactly
-   what the operator needs to know before risking real money. */
-async function loadReadiness() {
-  const data = await api('/readiness');
-  const verdict = $('#readiness-verdict');
-  verdict.textContent = data.ready ? 'sim, com ressalvas' : 'ainda não';
-  verdict.className = `chip ${data.ready ? 'ok' : 'bad'}`;
-
-  $('#readiness-gates').innerHTML = data.gates.map((gate) => `
-    <div class="gate ${gate.ok ? 'ok' : ''}">
-      <span class="gate-mark">${gate.ok ? '✓' : '○'}</span>
-      <div class="gate-text">
-        <span class="gate-label">${gate.label}</span>
-        <span class="gate-detail">${gate.detail}</span>
-      </div>
-      ${gate.progress === undefined ? '' : `
-        <div class="gate-bar"><div style="width:${Math.round(gate.progress * 100)}%"></div></div>`}
-    </div>`).join('');
-
-  const na = (value, suffix = '') => (value === null || value === undefined
-    ? '<span class="muted">calculando…</span>' : `${value}${suffix}`);
-  $('#readiness-expect').innerHTML = `
-    <div class="expect-col">
-      <h3>Esperado pelo teste histórico</h3>
-      <div class="expect-row"><span>Operações por mês</span>
-        <strong>${na(data.expected_trades_per_month)}</strong></div>
-      <div class="expect-row"><span>Resultado mensal</span>
-        <strong class="${cls(data.expected_return_pct_month)}">
-          ${data.expected_return_pct_month === null ? '—' : pct(data.expected_return_pct_month)}</strong></div>
-      <div class="expect-row"><span>Pior trimestre</span>
-        <strong class="neg">${data.expected_worst_quarter_pct === null ? '—'
-          : pct(data.expected_worst_quarter_pct)}</strong></div>
-      <div class="expect-row"><span>Capital exposto</span>
-        <strong>${money(data.deployed)} <span class="muted">de ${money(data.start_capital, 0)}</span></strong></div>
-    </div>
-    <div class="expect-col">
-      <h3>Obtido ao vivo (${data.mode === 'live' ? 'conta real' : 'testnet'})</h3>
-      <div class="expect-row"><span>Dias rodando</span><strong>${nf(data.days_live, 1)}</strong></div>
-      <div class="expect-row"><span>Operações encerradas</span>
-        <strong>${data.closed_trades}</strong></div>
-      <div class="expect-row"><span>Resultado realizado</span>
-        <strong class="${cls(data.realised_pnl)}">${signed(data.realised_pnl)}</strong></div>
-      <div class="expect-row"><span>Rebaixamento observado</span>
-        <strong class="${cls(data.observed_drawdown_pct)}">${nf(data.observed_drawdown_pct, 2)}%</strong></div>
-    </div>`;
-}
-
-/* The realised curve against the band that was written down before it existed.
-   Two separate honesty devices are at work here: the expectation is frozen at
-   deployment (a recomputed one would already contain the period it is judging),
-   and the band widens with the square root of elapsed time rather than
-   linearly, so a fortnight is not asked to land inside a quarterly tolerance. */
-async function loadTracking() {
-  const data = await api('/tracking');
-  const points = data.points || [];
-  const chip = $('#tracking-verdict');
-  const now = data.current;
-
-  $('#tracking-empty').hidden = points.length > 1;
-  $('#tracking-empty').textContent = data.status === 'ok'
-    ? 'Ainda sem pontos suficientes para traçar.' : `${data.status}.`;
-
-  if (!now || points.length < 2) {
-    chip.textContent = '—';
-    chip.className = 'chip';
-    $('#tracking-legend').innerHTML = '';
-    $('#tracking-now').innerHTML = '';
-    return;
-  }
-
-  const below = now.realised_pct < now.lower_pct;
-  chip.textContent = now.verdict;
-  chip.className = `chip ${below ? 'bad' : (now.inside_band ? 'ok' : '')}`;
-
-  const live = points.filter((p) => p.realised_pct !== null);
-  drawChart($('#tracking-chart'), [
-    {
-      points: points.map((p) => ({ t: p.time, y: p.upper_pct })),
-      bandTo: points.map((p) => p.lower_pct),
-      bandColor: 'rgba(91,124,250,0.13)',
-    },
-    {
-      points: points.map((p) => ({ t: p.time, y: p.expected_pct })),
-      color: 'rgba(139,148,178,0.9)', width: 1.5, dash: [5, 4], fill: false,
-    },
-    {
-      points: live.map((p) => ({ t: p.time, y: p.realised_pct })),
-      color: below ? '#f87171' : '#5b7cfa', width: 2, fill: false,
-    },
-  ], { fill: false, format: (value) => pct(value) });
-
-  $('#tracking-legend').innerHTML = `
-    <span class="legend-item"><i class="legend-swatch" style="border-top-color:${
-      below ? '#f87171' : '#5b7cfa'}"></i>realizado</span>
-    <span class="legend-item"><i class="legend-swatch" style="border-top-color:rgba(139,148,178,0.9);border-top-style:dashed"></i>trimestre mediano previsto</span>
-    <span class="legend-item"><i class="legend-swatch is-band" style="background:rgba(91,124,250,0.28)"></i>faixa até o pior trimestre previsto</span>`;
-
-  const base = (data.baselines || [])[data.baselines.length - 1] || {};
-  $('#tracking-now').innerHTML = `
-    <div class="expect-col">
-      <h3>Previsto quando o livro entrou</h3>
-      <div class="expect-row"><span>Congelado em</span>
-        <strong>${dt(base.recorded_at, false)}</strong></div>
-      <div class="expect-row"><span>Retorno mensal</span>
-        <strong class="${cls(base.return_pct_month)}">${pct(base.return_pct_month || 0)}</strong></div>
-      <div class="expect-row"><span>Pior trimestre</span>
-        <strong class="neg">${pct(base.worst_quarter_pct || 0)}</strong></div>
-      <div class="expect-row"><span>Revisões do livro</span>
-        <strong>${data.segments}</strong></div>
-    </div>
-    <div class="expect-col">
-      <h3>Onde está hoje</h3>
-      <div class="expect-row"><span>Realizado</span>
-        <strong class="${cls(now.realised_pct)}">${pct(now.realised_pct)}</strong></div>
-      <div class="expect-row"><span>Previsto para ${nf(now.days_live, 0)} dias</span>
-        <strong>${pct(now.expected_pct)}</strong></div>
-      <div class="expect-row"><span>Faixa hoje</span>
-        <strong>${pct(now.lower_pct)} a ${pct(now.upper_pct)}</strong></div>
-      <div class="expect-row"><span>Divergência</span>
-        <strong class="${cls(now.divergence_pct)}">${pct(now.divergence_pct)}</strong></div>
-    </div>`;
-}
-
-/* The book pooled by market condition. Shown next to the per-allocation slice
-   because the two answer different questions at different sample sizes: eight
-   windows cannot separate three buckets, and 136 can. */
-function renderRegimes(data) {
-  const rows = data.rows || [];
-  const chip = $('#regime-verdict');
-  chip.textContent = rows.length ? data.verdict : '—';
-  chip.className = `chip ${/^ganha/.test(data.verdict || '') ? 'ok'
-    : (/^n[aã]o ganha/.test(data.verdict || '') ? 'bad' : '')}`;
-  $('#regime-empty').hidden = rows.length > 0;
-  $('#regime-table').hidden = rows.length === 0;
-  $('#regime-table tbody').innerHTML = rows.map((r) => `
-    <tr>
-      <td><b class="${REGIME_TONE[r.regime] || ''}">${esc(r.label)}</b></td>
-      <td class="num">${r.windows}</td>
-      <td class="num muted">${nf(r.share_pct, 0)}%</td>
-      <td class="num ${r.profitable_pct >= 50 ? 'pos' : 'neg'}">${nf(r.profitable_pct, 0)}%</td>
-      <td class="num ${cls(r.median_return_pct)}">${pct(r.median_return_pct)}</td>
-      <td class="num ${cls(r.median_alpha_pct)}">${pct(r.median_alpha_pct)}</td>
-      <td class="num neg">${pct(r.worst_pct)}</td>
-      <td class="num muted">${pct(r.median_buy_hold_pct)}</td>
-      <td class="num">${r.trades}</td>
-    </tr>`).join('');
-}
-
-async function loadValidation(refresh = false) {
-  const state_ = await api(`/validation${refresh ? '?refresh=true' : ''}`);
-  const label = { idle: 'nunca calculado', running: 'calculando…', done: '', error: 'erro' };
-  $('#validation-state').textContent = state_.status === 'done'
-    ? `atualizado ${new Date(state_.checked_at * 1000).toLocaleString('pt-BR')}`
-    : (label[state_.status] || state_.status);
-
-  const reports = state_.reports || [];
-  $('#validation-empty').hidden = reports.length > 0 || state_.status === 'running';
-  $('#validation-empty').textContent = state_.status === 'running'
-    ? 'Calculando — cada estratégia percorre três anos de histórico.'
-    : 'Nenhuma estratégia em operação para validar.';
-  $('#validation-cards').innerHTML = reports.map(validationCard).join('');
-  renderRegimes(state_.regimes || { rows: [], verdict: '' });
-
-  $$('[data-vtoggle]').forEach((head) => head.addEventListener('click', () => {
-    const detail = $(`#vdet-${head.dataset.vtoggle}`);
-    detail.hidden = !detail.hidden;
-    $(`#vexp-${head.dataset.vtoggle}`).textContent = detail.hidden ? '▾' : '▴';
-  }));
-
-  /* The first request only kicks the background thread off. */
-  if (state_.status === 'running') setTimeout(() => {
-    if (state.view === 'validation') loadValidation();
-  }, 4000);
-}
 
 /* ------------------------------------------------------------------ router */
 
@@ -1769,22 +1258,31 @@ function switchView(view) {
   const [title, subtitle] = VIEW_META[view];
   $('#view-title').textContent = title;
   $('#view-subtitle').textContent = subtitle;
+  window.scrollTo(0, 0);
   refresh();
 }
 
-async function refresh() {
+async function refresh({ keepScroll = false } = {}) {
+  /* Hold the document's floor at the height it has right now, for as long as
+     the redraw takes. Every version of this jump had the same shape: a panel
+     is rewritten, the page is briefly shorter than the reader's scroll offset,
+     and the browser clamps the offset to the new bottom. Reserving the height
+     means there is nothing to clamp to.
+
+     The previous attempt put the offset back afterwards instead, which fixed
+     the clamp and introduced a worse bug: a reader who scrolled while the
+     request was in flight got yanked back to where they were a second ago.
+     Holding the floor needs no correction at all, so there is nothing to yank. */
+  const floor = keepScroll ? document.documentElement.scrollHeight : 0;
+  if (floor) document.body.style.minHeight = `${floor}px`;
   try {
     await loadStatus();
     if (state.view === 'dashboard') await loadDashboard();
     else if (state.view === 'lab') await loadLab();
-    else if (state.view === 'trades') { await loadParity(); await loadLedger(); await loadTrades(); }
-    else if (state.view === 'validation') {
-      await loadReadiness(); await loadTracking();
-      await loadCoverage(); await loadValidation();
-    }
-    else if (state.view === 'settings') await loadSettings();
   } catch (error) {
     toast(error.message, 'error');
+  } finally {
+    if (floor) document.body.style.minHeight = '';
   }
 }
 
@@ -1807,14 +1305,9 @@ $('#btn-save-risk').addEventListener('click', async () => {
   }
 });
 
-$('#btn-validate').addEventListener('click', () => {
-  $('#validation-state').textContent = 'calculando…';
-  loadValidation(true).catch((error) => toast(error.message, 'error'));
-});
-
 $('#btn-refresh').addEventListener('click', (event) => {
   event.currentTarget.querySelector('svg').classList.add('spin');
-  refresh().finally(() =>
+  refresh({ keepScroll: true }).finally(() =>
     setTimeout(() => event.currentTarget.querySelector('svg').classList.remove('spin'), 400));
 });
 
@@ -1830,11 +1323,9 @@ $('#btn-toggle-bot').addEventListener('click', async () => {
 });
 
 $('#btn-close-all').addEventListener('click', async () => {
-  const book = state.book === 'ml' ? 'do laboratório' : 'do livro validado';
-  if (!confirm(`Encerrar todas as posições abertas ${book} a mercado?`)) return;
+  if (!confirm('Encerrar todas as posições abertas a mercado?')) return;
   try {
-    const result = await api(
-      state.book === 'ml' ? '/lab/close-all' : '/bot/close-all', { method: 'POST' });
+    const result = await api('/bot/close-all', { method: 'POST' });
     toast(`${result.closed.length} posição(ões) encerrada(s)`, 'ok');
     refresh();
   } catch (error) { toast(error.message, 'error'); }
@@ -1856,76 +1347,10 @@ $('#btn-research').addEventListener('click', async () => {
 
 $('#chk-validated').addEventListener('change', loadLab);
 
-$$('#book-toggle .seg-btn').forEach((button) => button.addEventListener('click', () => {
-  if (state.book === button.dataset.book) return;
-  state.book = button.dataset.book;
-  loadDashboard().catch((error) => toast(error.message, 'error'));
-}));
-
-$('#btn-exit-toggle').addEventListener('click', async () => {
-  const running = state.exit?.running;
-  try {
-    const result = await api(running ? '/mirror/stop' : '/mirror/start', { method: 'POST' });
-    toast(result.running ? 'Estudo de saída ligado' : 'Estudo de saída parado', 'ok');
-    await loadDashboard();
-  } catch (error) { toast(error.message, 'error'); }
-});
-
-$('#btn-exit-tick').addEventListener('click', async () => {
-  try {
-    const result = await api('/mirror/tick', { method: 'POST' });
-    toast(`${result.actions.length} movimento(s)`, 'ok');
-    await loadDashboard();
-  } catch (error) { toast(error.message, 'error'); }
-});
-
-$('#btn-lab-toggle').addEventListener('click', async () => {
-  const running = state.lab?.status?.running;
-  try {
-    const result = await api(running ? '/lab/stop' : '/lab/start', { method: 'POST' });
-    if (!running && !result.running) toast('Treine um modelo antes de ligar', 'error');
-    else toast(result.running ? 'Laboratório ligado' : 'Laboratório parado', 'ok');
-    refresh();
-  } catch (error) { toast(error.message, 'error'); }
-});
-
-$('#btn-lab-tick').addEventListener('click', async () => {
-  try {
-    const result = await api('/lab/tick?force=true', { method: 'POST' });
-    toast(result.skipped
-      ? `Ciclo pulado: ${result.skipped}`
-      : `Ciclo executado: ${(result.actions || []).length} ação(ões)`, 'ok');
-    refresh();
-  } catch (error) { toast(error.message, 'error'); }
-});
-
-/* Training takes about a minute, so the button starts it and then watches. */
-$('#btn-lab-train').addEventListener('click', async () => {
-  try {
-    await api('/lab/train', { method: 'POST' });
-    toast('Treinando — leva cerca de um minuto');
-    const watch = setInterval(async () => {
-      const status = await api('/lab/train/status');
-      if (status.running) return;
-      clearInterval(watch);
-      if (status.error) toast(status.error, 'error');
-      else if (status.result?.error) toast(status.result.error, 'error');
-      else if (status.result) toast(`Modelo ${status.result.model_id} treinado`, 'ok');
-      refresh();
-    }, 4000);
-  } catch (error) { toast(error.message, 'error'); }
-});
-
 $$('#breakdown-toggle .seg-btn').forEach((button) => button.addEventListener('click', () => {
   $$('#breakdown-toggle .seg-btn').forEach((other) => other.classList.toggle('is-on', other === button));
   state.breakdownGroup = button.dataset.group;
   if (state.breakdown) renderBreakdown(state.breakdown[state.breakdownGroup]);
-}));
-
-$$('#trades-mode .seg-btn').forEach((button) => button.addEventListener('click', () => {
-  $$('#trades-mode .seg-btn').forEach((other) => other.classList.toggle('is-on', other === button));
-  state.tradesMode = button.dataset.mode;
-  loadTrades();
 }));
 
 $('#btn-allocate').addEventListener('click', async () => {
@@ -1981,4 +1406,4 @@ window.addEventListener('resize', () => {
 });
 
 refresh();
-setInterval(() => { if (!document.hidden) refresh(); }, 15000);
+setInterval(() => { if (!document.hidden) refresh({ keepScroll: true }); }, 15000);

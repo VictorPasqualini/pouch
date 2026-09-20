@@ -1427,20 +1427,20 @@ Two defects in `deploy/install.sh` surfaced on first use, both fixed:
 `mkswap` failed — would have skipped the whole block on the retry and left a
 2 GB swapfile that was never formatted or activated.
 
-### 2. Give the host enough memory to run all three books
+### 2. Give the host enough memory to run both books
 
-The micro shape has 956 MB usable, and three books plus the headline scorer do
-not fit in it. With the validated book, the exit study and FinBERT all resident,
-the machine thrashed: 22 MB/s paging back in, 44% iowait, and six ticks lost in
-35 minutes to `handshake operation timed out` and `read operation timed out`.
-The CPU was idle throughout — load average 0.08 — so this is a memory
+The micro shape has 956 MB usable, and two books plus the headline scorer do
+not fit in it. With a second book and FinBERT resident alongside the validated
+one, the machine thrashed: 22 MB/s paging back in, 44% iowait, and six ticks
+lost in 35 minutes to `handshake operation timed out` and `read operation timed
+out`. The CPU was idle throughout — load average 0.08 — so this is a memory
 constraint and nothing else. A thread waiting on a page fault cannot finish a
 TLS handshake inside the client's 20-second timeout.
 
-Stopping the exit study ended it immediately: paging went to zero and stayed
-there. That is the current state — validated book running, exit study and lab
-stopped — and it is not a resting place, because item 3 depends on the exit
-study being allowed to report.
+Stopping the second book ended it immediately: paging went to zero and stayed
+there. That is the current state — validated book running, lab stopped — and it
+is a ceiling on anything that adds a resident process, the real-money phase
+below included.
 
 `torch` is resident whether or not the lab runs: `bot/sentiment.py` loads
 FinBERT lazily on the first headline and caches the pipeline in a module global,
@@ -1454,8 +1454,8 @@ Three ways out, none chosen yet:
   the question rather than trading one thing off against another. The risk is
   stock in `sa-saopaulo-1`, which is frequently exhausted; the migration itself
   is the one already rehearsed above.
-- **Drop `torch` and `transformers`.** Frees the ~500 MB immediately and lets
-  the exit study back on. Headlines keep being collected; `sentiment` goes NULL
+- **Drop `torch` and `transformers`.** Frees the ~500 MB immediately. Headlines
+  keep being collected; `sentiment` goes NULL
   from that day forward. A column scored for one stretch and not the next is
   exactly the discontinuity `sentiment_model` exists to make visible, so this
   costs the feature for the ranking model, not just a nice-to-have.
@@ -1472,18 +1472,14 @@ and large in what it teaches: it is the only item on this list that tests
 custody, funding, real fills and real fees, none of which the Spot Testnet can
 be made to charge.
 
-It is also the same question the Phase 18 exit study measures, on paper, on the
-validated book's own trades. That study is the dry run for this phase and
-should be allowed to report before it starts — if holding beats selling into
-strength on the paired trades, the second strategy is answered before a cent is
-spent.
+The paper study that was going to settle the sell-into-strength half of it was
+removed on 2026-09-19 (see the decision log), so that question is open and has
+to be answered by this phase or by a backtest, not before it.
 
 What has to be built or decided first, in order:
 
 1. **An always-on host.** Item 1 is done, so what remains of this prerequisite
-   is item 2: the exit study cannot report from a machine that has to keep it
-   stopped to stay responsive, and a strategy that sells on strength cannot
-   miss candle closes.
+   is item 2: a strategy that sells on strength cannot miss candle closes.
 2. **Two strategies on one spot balance.** The decision log says one allocation
    per symbol, for a concrete reason: on a spot account both strategies own the
    same BTC, so the seller can sell the holder's coins. Nothing in the ledger
@@ -1504,7 +1500,7 @@ What has to be built or decided first, in order:
 5. **The minimum order size.** $20 split two ways is $10 a leg. Binance's
    BTCUSDT minimum notional and lot step decide whether that is even placeable,
    and `exchange.round_qty` floors to the step — so the real purchase is never
-   exactly $10, which the lab and the exit study both had to be fixed for.
+   exactly $10, which the lab had to be fixed for.
 
 Two things worth writing down before the temptation arrives:
 
@@ -1513,7 +1509,7 @@ Two things worth writing down before the temptation arrives:
   indistinguishable from noise. There is no measured edge in this repository for
   timing Bitcoin. The seller therefore starts as a question, not as a strategy —
   and "sells when it is up" is not yet a rule: up by how much, measured from
-  what, is exactly what the exit study exists to answer.
+  what, is undecided and has to be pre-registered before a cent is spent.
 - **`BINANCE_TESTNET=false` points every order at the real exchange.** Real keys
   for this phase should be created fresh, restricted to spot trading with
   withdrawals disabled, and IP-allowlisted to the host from item 1. The keys
@@ -1530,24 +1526,7 @@ beating a long benchmark with a long-only book in a rally is not the thing this
 book is for. Both need the forward test to finish first — changing what gets
 traded now would end the test of what was measured.
 
-### 5. Promote or bury the ranking model
-
-Phase 18 built it as a separate book on purpose: it is an experiment, and an
-experiment that shares a ledger with a frozen forward test contaminates it. That
-separation is temporary and has an expiry condition. If the paper book tracks
-its measured +0.117% a day over a few months, the model goes into the strategy
-catalogue as a `Strategy` and faces the same walk-forward, the same regime
-labelling and the same harsh verdict as everything else — a model judged by a
-looser rule than the rest of the book will always look better than the rest of
-the book. If it does not track, it is deleted and the phase stands as a measured
-negative.
-
-The point-in-time features from Phase 17 enter on their own schedule. Sentiment
-and positioning are already wired into the panel and gated at 30% coverage, so
-they arrive when there is enough history to walk them forward, around a year
-from the start of collection, and not before.
-
-### 6. Short and market-neutral
+### 5. Short and market-neutral
 
 Everything so far is spot-long-only, which means every strategy is structurally
 long crypto beta. That is why beating buy-and-hold is so hard: the benchmark is
@@ -1620,24 +1599,9 @@ market-neutral comparison.
 | Store the sentiment model name on every row | The day the model is upgraded is the day older scores stop being comparable, and that has to be visible rather than inferred |
 | A feature under 30% coverage is excluded automatically | Otherwise it is a date in disguise and the model learns "this is recent" instead of "this is news" |
 | Report capital at work beside capital | A basket of three at 100 USDT deploys 300 whatever the capital line says; comparing the two books on the capital line compares how much idle cash each is sitting on |
-| The exit argument is settled by a third book, not by a backtest rerun | The dispute is about live trades handing back live gains, and a paired forward test on those exact trades answers it with the one thing a rerun cannot supply: the trades in question |
-| Pre-register three targets, not a grid | Best-of-thirty is the maximum of thirty correlated draws; three spread wide show whether the effect has a shape or is a point that got lucky |
-| Fill targets on the candle high, never the close | A limit order fills when price trades through it, and reading closes would miss exactly the intrabar spike-and-give-back the study exists to measure |
-| Exclude the entry bar from target fills | Its high may have printed before the entry, and a fill credited to a price that traded before the position existed is invented profit |
-| Charge every arm the same exit cost | A limit exit plausibly slips less than a market exit, so pricing them differently would hand the targets an advantage that is an accounting choice rather than a result |
-| Tag adopted positions and report them apart | Starting the study by inheriting an open winner would otherwise show that inheritance as the arm's own result |
-| Fund the third book from idle balance, never from an existing book's capital | Equity is stored as capital plus result, so taking capital out of a running book shifts its whole curve and breaks the forward test it is in the middle of |
 | Say "sample too small" in the panel, not in the docs | The number will be read as a ranking the moment it has two rows; the only reliable place to say it is not one yet is next to it |
-| The four arms share one capital figure, not one each | They are alternative histories of the same money and only one can be true; multiplying the base by four invents capital that never existed and divides every return by four |
-| The exit study lives in the validated book's tab | It is a question about that book's trades, and a tab of its own asked the reader to hold the book's numbers in their head while looking at the answer |
-| Every event carries the book that wrote it | Three books in one feed makes the feed useless: what a reader wants from an activity list is what the book in front of them just did |
+| Every event carries the book that wrote it | Two books in one feed makes the feed useless: what a reader wants from an activity list is what the book in front of them just did |
+| The exit study was deleted, not left switched off | Code that nothing runs still has to be read, migrated and reasoned about; its own decisions above went with it, because rationale for a thing that no longer exists misleads the next reader rather than informing them |
+| The ranking model was deleted rather than promoted or buried on its numbers | It was always an experiment with an expiry, and the book it would have been judged against is going to real money; carrying a second, unvalidated book through that move costs memory on a host that has none and attention that belongs on the book holding the money |
 | Record what an order would really cost, not what it asked for | An exchange sells in lot steps, so a round 100 USDT on every line is the one number guaranteed to be wrong - and it is the denominator of every return in the book |
-| The exit study stays a measurement and never places orders | A second funded book would need cash the account does not have, and the question asked is a paired difference where both sides are priced by the same method and the method's error subtracts out |
-| The study is denominated at the live book's own capital | The control arm is the live book restricted to mirrored trades; denominating it differently would make the two sets of percentages look comparable while measuring different denominators |
-| Changing the study's capital restates its curves in place | Equity is stored as capital plus P&L, so a new capital steps every line at that instant; unlike the live book's snapshots these rows are computed, not reported, so restating them destroys no evidence |
-| The verdict goes above the fold, the workings below it | The study's whole output is one number per target and it sat five panels down; a conclusion that has to be found is a conclusion that is read once |
-| Paired differences are recomputed, never stored | Each difference is a function of two trades already kept in full; a table of differences is a copy that can drift from the rows it came from |
 | Report the spread and t beside every paired mean | A mean with no scatter behind it lets a sign be read as an answer; below \|t\| = 2 the difference is inside its own noise whichever way it points |
-| Say why there is no pair yet, not just that there is none | The usual reason is the informative one - the target sold and the rule is still holding - and a bare "no pairs" reads as a broken panel |
-| The study is one panel: four rows, one chart, one sentence | Five open panels answering a single question outweighed the book the tab is about, and a dashboard that has to be scanned is a dashboard that stops being read |
-| The workings fold behind a summary rather than being deleted | Every pair has to stay checkable by hand - that is the whole point of pairing - but checking is a thing done occasionally and scrolling is a thing done daily |

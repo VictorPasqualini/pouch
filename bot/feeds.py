@@ -312,6 +312,29 @@ def _tasks() -> dict[str, Callable[[], int]]:
     }
 
 
+# Collection is on by default, because the dataset's value is being unbroken
+# and a switch that defaults to off is a switch that silently loses history.
+# It exists anyway for two reasons the roadmap already names: the collector
+# calls the headline scorer after every poll, and FinBERT is ~500 MB resident
+# once it has scored anything, which is what makes the micro host thrash; and
+# a run that has no model to feed is paying for bandwidth and memory it is not
+# using. Turning it off is a decision with a cost - positioning and headlines
+# have a retention window measured in days, so the period spent off is a hole
+# that cannot be backfilled - and it is recorded in the event log for that
+# reason.
+DEFAULTS: dict[str, Any] = {"enabled": True}
+
+
+def get_config() -> dict[str, Any]:
+    return {**DEFAULTS, **(storage.get_state("feeds_config") or {})}
+
+
+def save_config(patch: dict[str, Any]) -> dict[str, Any]:
+    config = {**get_config(), **patch}
+    storage.set_state("feeds_config", config)
+    return config
+
+
 class Collector:
     """One thread, every feed on its own clock.
 
@@ -339,13 +362,27 @@ class Collector:
         with self._lock:
             if self.running:
                 return {"running": True, "message": "already running"}
+            save_config({"enabled": True})
+            storage.log_event("info", "Coleta de contexto ligada")
             self._stop.clear()
             self._thread = threading.Thread(target=self._loop, daemon=True,
                                             name="feeds")
             self._thread.start()
             return {"running": True, "message": "started"}
 
-    def stop(self) -> dict[str, Any]:
+    def stop(self, remember: bool = True) -> dict[str, Any]:
+        """Stop polling.
+
+        ``remember`` is false on shutdown: the process ending is not the
+        operator deciding to collect nothing, and writing that decision on
+        every restart would make the switch impossible to leave on.
+        """
+        if remember and get_config().get("enabled"):
+            save_config({"enabled": False})
+            storage.log_event(
+                "warning",
+                "Coleta de contexto desligada — posicionamento e manchetes"
+                " deste periodo nao poderao ser recuperados depois")
         self._stop.set()
         return {"running": False, "message": "stopped"}
 
@@ -400,7 +437,11 @@ def coverage() -> dict[str, Any]:
     for row in storage.query(
         "SELECT feed, COUNT(*) AS rows, COUNT(DISTINCT symbol) AS symbols,"
         " MIN(source_ts) AS first_ts, MAX(source_ts) AS last_ts,"
-        " MAX(observed_at) AS last_seen"
+        # When this process first saw anything from the feed. Distinct from
+        # `first_ts`, which for a backfilled series reaches back years before
+        # the collector existed - funding to 2020, Fear and Greed to 2018. Only
+        # `observed_at` says when the clock actually started.
+        " MIN(observed_at) AS first_seen, MAX(observed_at) AS last_seen"
         " FROM feed_observations GROUP BY feed ORDER BY feed"
     ):
         entry = dict(row)
@@ -421,9 +462,43 @@ def coverage() -> dict[str, Any]:
 
     return {
         "running": collector.running,
+        "enabled": bool(get_config().get("enabled")),
         "feeds": feeds,
         "news": news,
         "cadence_seconds": CADENCE_SECONDS,
+        "progress": progress(feeds + [news]),
+    }
+
+
+# Twelve months, and the number is not arbitrary. A walk-forward needs eight
+# quarterly windows to say anything, and eight quarters of point-in-time data
+# is two years - but the first honest read comes at four, which is the year
+# below. Until then the only claim the dataset supports is that the clock has
+# started. See the Phase 17 notes in ROADMAP.md.
+TARGET_DAYS = 365
+
+
+def progress(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """How far along the collection is, measured from its own first row.
+
+    Measured on `observed_at`, never on `source_ts`. A backfilled series looks
+    six years deep on the day it is installed, and reporting that as progress
+    would say the dataset is finished before it has collected anything.
+    """
+    seen = [row.get("first_seen") for row in rows if row.get("first_seen")]
+    if not seen:
+        return {"started_at": None, "days": 0, "target_days": TARGET_DAYS,
+                "pct": 0.0, "days_left": TARGET_DAYS, "rows": 0}
+    started = min(seen)
+    days = _span_days(started, _now())
+    total = sum(int(row.get("rows") or 0) for row in rows)
+    return {
+        "started_at": started,
+        "days": days,
+        "target_days": TARGET_DAYS,
+        "pct": round(min(days / TARGET_DAYS * 100, 100.0), 1),
+        "days_left": max(TARGET_DAYS - days, 0),
+        "rows": total,
     }
 
 
