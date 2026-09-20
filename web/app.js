@@ -100,6 +100,45 @@ function setHTML(target, html) {
   return true;
 }
 
+/* ------------------------------------------------------------------- forms */
+
+/* Um ciclo de atualização não pode digitar por cima de quem está digitando.
+
+   A primeira tentativa protegia só o campo com foco, o que parece bastar e não
+   basta: um formulário tem vários campos e só um pode ter o foco. Quem digita
+   num campo e passa para o seguinte deixou o primeiro sem foco, e o próximo
+   ciclo devolve o valor antigo a ele. A pessoa então salva o que o ciclo
+   escreveu em vez do que ela digitou.
+
+   Por isso a unidade é o formulário, não o campo. Assim que qualquer coisa
+   dentro dele é tocada, nada dentro dele é escrito até a edição ser salva. */
+const editing = new Set();
+
+function syncForm(id, values) {
+  const root = $(id);
+  if (!root) return false;
+  if (!root.__watched) {
+    root.__watched = true;
+    const touch = () => { editing.add(id); root.classList.add('is-dirty'); };
+    root.addEventListener('input', touch);
+    root.addEventListener('change', touch);
+  }
+  if (editing.has(id)) return false;
+  for (const [selector, value] of Object.entries(values)) {
+    const el = $(selector);
+    if (!el) continue;
+    if (el.type === 'checkbox') el.checked = Boolean(value);
+    else el.value = value;
+  }
+  return true;
+}
+
+/* Depois de salvar, o servidor volta a ser a fonte da verdade. */
+function releaseForm(id) {
+  editing.delete(id);
+  $(id)?.classList.remove('is-dirty');
+}
+
 /* ------------------------------------------------------------------ charts */
 
 function drawChart(canvas, series, { fill = true, tipTarget = null, format = money } = {}) {
@@ -1126,16 +1165,13 @@ function renderBot(data, config) {
       <b class="${tone}">${value}</b><span class="muted">${label}</span>
     </span>`).join(''));
 
-  /* Values in, but never over a field being edited. */
-  const fill = (sel, value) => {
-    const el = $(sel);
-    if (el && el !== document.activeElement) el.value = value;
-  };
-  fill('#in-mode', config.mode);
-  fill('#in-poll', config.poll_seconds);
-  fill('#in-quote', config.quote_per_trade);
-  fill('#in-maxpos', config.max_positions);
-  fill('#in-capital', config.start_capital);
+  syncForm('#bot-form', {
+    '#in-mode': config.mode,
+    '#in-poll': config.poll_seconds,
+    '#in-quote': config.quote_per_trade,
+    '#in-maxpos': config.max_positions,
+    '#in-capital': config.start_capital,
+  });
 }
 
 function renderAllocations(config) {
@@ -1224,10 +1260,12 @@ function every(seconds) {
 function renderRisk(risk) {
   const settings = risk.settings || {};
   const dd = risk.drawdown || {};
-  $('#in-maxdd').value = settings.max_drawdown_pct ?? 0;
-  $('#in-resumedd').value = settings.resume_drawdown_pct ?? 0;
-  $('#in-maxcorr').value = settings.max_correlation ?? 0;
-  $('#in-volsize').checked = Boolean(settings.volatility_sizing);
+  syncForm('#risk-form', {
+    '#in-maxdd': settings.max_drawdown_pct ?? 0,
+    '#in-resumedd': settings.resume_drawdown_pct ?? 0,
+    '#in-maxcorr': settings.max_correlation ?? 0,
+    '#in-volsize': Boolean(settings.volatility_sizing),
+  });
 
   const chip = $('#risk-state');
   const active = dd.enabled || settings.volatility_sizing || settings.max_correlation > 0;
@@ -1299,6 +1337,7 @@ $('#btn-save-risk').addEventListener('click', async () => {
       max_correlation: Number($('#in-maxcorr').value),
       volatility_sizing: $('#in-volsize').checked,
     } }));
+    releaseForm('#risk-form');
     toast('Controles de risco salvos');
   } catch (error) {
     toast(error.message, 'error');
@@ -1379,6 +1418,7 @@ $('#btn-save-config').addEventListener('click', async () => {
         start_capital: Number($('#in-capital').value),
       },
     });
+    releaseForm('#bot-form');
     toast('Ajustes salvos', 'ok');
     refresh();
   } catch (error) { toast(error.message, 'error'); }
