@@ -189,121 +189,6 @@ CREATE INDEX IF NOT EXISTS idx_headline_seen
 -- own tables rather than sharing the live book's. The live book is a forward
 -- test whose value is that nothing has touched it, so the experiment gets no
 -- write path into positions, orders or equity_snapshots at all. Isolation by
--- schema, not by a flag someone can forget to filter on.
-CREATE TABLE IF NOT EXISTS lab_positions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol      TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'open',
-    qty         REAL NOT NULL,
-    entry_price REAL NOT NULL,
-    entry_time  TEXT NOT NULL,
-    entry_quote REAL NOT NULL,
-    -- The model's probability at entry, and the model that produced it. Two
-    -- trades taken at 0.51 and 0.80 are not the same trade, and a book that
-    -- cannot tell them apart cannot tell whether the probability means
-    -- anything.
-    entry_prob  REAL,
-    model_id    INTEGER,
-    exit_price  REAL,
-    exit_time   TEXT,
-    exit_quote  REAL,
-    exit_prob   REAL,
-    pnl         REAL,
-    return_pct  REAL,
-    reason      TEXT,
-    features    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_lab_positions ON lab_positions(status, entry_time DESC);
-
-CREATE TABLE IF NOT EXISTS lab_equity (
-    ts              TEXT PRIMARY KEY,
-    total_value     REAL NOT NULL,
-    free_quote      REAL NOT NULL,
-    positions_value REAL NOT NULL,
-    open_positions  INTEGER NOT NULL
-);
-
--- One row per training run, kept forever. A model that is retrained weekly and
--- overwritten leaves no way to ask whether this week's version is better than
--- the one that took last month's trades, which is the only question that
--- matters about retraining.
-CREATE TABLE IF NOT EXISTS lab_models (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    trained_at   TEXT NOT NULL,
-    rows         INTEGER NOT NULL,
-    features     TEXT NOT NULL,
-    params       TEXT NOT NULL,
-    -- Purged walk-forward results, measured against holding the whole universe
-    -- equally weighted rather than against zero.
-    cv           TEXT NOT NULL,
-    -- Share of days the model's basket beat that benchmark.
-    accuracy     REAL NOT NULL,
-    edge_pct     REAL NOT NULL,
-    -- How many coins the basket holds. Positions are chosen by rank, so there
-    -- is no probability cut-off to store.
-    top_k        INTEGER NOT NULL,
-    active       INTEGER NOT NULL DEFAULT 0,
-    blob         TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_lab_models ON lab_models(trained_at DESC);
-
--- ------------------------------------------------------------- the exit study
---
--- A third book, and the narrowest one: it takes the live book's entries, bar
--- for bar, and changes only how they end. One arm exits exactly when the
--- strategy says to; the others sell the moment the position shows a fixed
--- profit. Everything else - which coin, when it was bought, at what price, at
--- what size - is held identical, so the difference between the arms is the
--- exit and cannot be anything else.
---
--- It reads `positions` and never writes to it. Same rule as the lab: isolation
--- by schema, not by a flag someone can forget to filter on. A live position is
--- mirrored at most once per arm, and the unique index below is what enforces
--- it - a retry, a double tick or a restart mid-write cannot open the same
--- trade twice, because the database refuses rather than the code remembering.
-CREATE TABLE IF NOT EXISTS mirror_positions (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    arm          TEXT NOT NULL,
-    -- The live position this one shadows. The whole comparison rests on this
-    -- being the same trade, so it is stored rather than inferred from symbol
-    -- and time, which would pair the wrong two after a re-entry.
-    source_id    INTEGER NOT NULL,
-    symbol       TEXT NOT NULL,
-    interval     TEXT NOT NULL,
-    strategy     TEXT NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'open',
-    qty          REAL NOT NULL,
-    entry_price  REAL NOT NULL,
-    entry_time   TEXT NOT NULL,
-    entry_quote  REAL NOT NULL,
-    -- Null on the control arm, which has no target and waits for the rule.
-    target_pct   REAL,
-    target_price REAL,
-    exit_price   REAL,
-    exit_time    TEXT,
-    exit_quote   REAL,
-    pnl          REAL,
-    return_pct   REAL,
-    reason       TEXT,
-    -- Set when the arm inherited a position that was already open when the
-    -- study started. Those trades are real but they were not chosen by this
-    -- book, and a result that depends on them is a result about one lucky
-    -- inheritance.
-    adopted      INTEGER NOT NULL DEFAULT 0
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_mirror_pair
-    ON mirror_positions(arm, source_id);
-CREATE INDEX IF NOT EXISTS idx_mirror_open
-    ON mirror_positions(status, arm);
-
-CREATE TABLE IF NOT EXISTS mirror_equity (
-    arm             TEXT NOT NULL,
-    ts              TEXT NOT NULL,
-    total_value     REAL NOT NULL,
-    positions_value REAL NOT NULL,
-    open_positions  INTEGER NOT NULL,
-    PRIMARY KEY (arm, ts)
-);
 
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
@@ -335,15 +220,30 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("orders", "fee_asset", "TEXT"),
     ("events", "first_ts", "TEXT"),
     ("events", "repeats", "INTEGER NOT NULL DEFAULT 1"),
-    # Which book wrote the line. The feed is unreadable when three books share
+    # Which book wrote the line. The feed is unreadable when both books share
     # it: the one thing a reader wants from an activity list is what *this*
-    # book just did, and that is impossible to see interleaved with two others.
+    # book just did, and that is impossible to see interleaved with another.
     ("events", "source", "TEXT NOT NULL DEFAULT 'bot'"),
     # A score is only interpretable next to the model that produced it, so the
     # model name is stored per row rather than assumed. See bot/sentiment.py.
     ("feed_headlines", "sentiment", "REAL"),
     ("feed_headlines", "sentiment_model", "TEXT"),
     ("feed_headlines", "scored_at", "TEXT"),
+)
+
+
+# Tables and kv keys left behind by features that were removed. A database
+# created before the removal still carries them, and a schema nobody can find
+# the code for is worse than no schema at all: the next reader has to work out
+# whether it is dead or merely idle. Dropped here so the file on disk always
+# matches SCHEMA above.
+DROPPED_TABLES: tuple[str, ...] = (
+    "mirror_positions", "mirror_equity",
+    "lab_positions", "lab_equity", "lab_models",
+)
+DROPPED_KEYS: tuple[str, ...] = (
+    "mirror_config", "mirror_started_at", "mirror_last_tick",
+    "lab_config", "lab_last_day", "lab_last_rebalance", "lab_last_train",
 )
 
 
@@ -354,6 +254,11 @@ def init() -> None:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    for table in DROPPED_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for key in DROPPED_KEYS:
+        conn.execute("DELETE FROM kv WHERE key = ?", (key,))
+    conn.execute("DELETE FROM events WHERE source IN ('mirror', 'lab')")
     conn.commit()
 
 

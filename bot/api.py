@@ -6,15 +6,13 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import backtest as bt
 from . import coverage
 from . import feeds
-from . import lab
-from . import mirror
 from . import parity
 from . import report, research, sentiment, signals, storage
 from . import portfolio, screening, tracking, walkforward
@@ -37,22 +35,15 @@ async def lifespan(_app: FastAPI):
         storage.log_event("info", "Bot resumed after restart")
     # Started with the server rather than with the bot, and never stopped by
     # /api/bot/stop. The dataset's value is being unbroken, so pausing trading
-    # to change a strategy must not put a hole in it.
-    feeds.collector.start()
-    # The experiment resumes on the same terms as the live book: only if it was
-    # running when the process died, and only if it has a model to run.
-    lab_config = lab.get_config()
-    if lab_config.get("enabled") and lab.active_model() is not None:
-        lab.trader.start()
-    # The exit study shadows the live book, so it resumes on the same terms:
-    # only if it was running when the process died.
-    if mirror.get_config().get("enabled"):
-        mirror.trader.start()
+    # to change a strategy must not put a hole in it. It resumes only if it was
+    # collecting when the process died, so a deliberate stop survives a restart.
+    if feeds.get_config().get("enabled"):
+        feeds.collector.start()
     yield
     bot.stop()
-    lab.trader.stop()
-    mirror.trader.stop()
-    feeds.collector.stop()
+    # Shutdown is not the operator choosing to collect nothing, so it does not
+    # write that choice down.
+    feeds.collector.stop(remember=False)
 
 
 app = FastAPI(title="Pouch", version="1.0.0", docs_url="/api/docs", lifespan=lifespan)
@@ -242,6 +233,51 @@ def screen(symbols: str, interval: str = "1d",
     return screening.screen(wanted[:40], interval, candles)
 
 
+@app.get("/api/monthly")
+def monthly() -> dict[str, Any]:
+    """Realised result month by month, credited on the exit."""
+    return report.monthly()
+
+
+@app.get("/api/trades/export.csv")
+def trades_csv(limit: int = 5000) -> PlainTextResponse:
+    """Every trade as a spreadsheet, for reading somewhere this is not.
+
+    Written by hand rather than through `csv` because the only awkward field is
+    the reason text, and quoting that is three lines. Numbers are left
+    unformatted - a locale-formatted number is a string to every spreadsheet
+    that opens this, and the whole point is to do arithmetic on it elsewhere.
+    """
+    rows = report.trades(limit)
+    columns = [
+        ("id", "id"), ("symbol", "moeda"), ("interval", "tempo_grafico"),
+        ("strategy", "estrategia"), ("status", "estado"), ("mode", "modo"),
+        ("qty", "quantidade"), ("entry_time", "entrada_em"),
+        ("entry_price", "entrada_preco"), ("entry_quote", "entrada_valor"),
+        ("exit_time", "saida_em"), ("exit_price", "saida_preco"),
+        ("exit_quote", "saida_valor"), ("pnl", "resultado"),
+        ("return_pct", "retorno_pct"), ("duration_seconds", "duracao_segundos"),
+        ("reason", "motivo"),
+    ]
+
+    def cell(value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value)
+        if any(ch in text for ch in (",", '"', "\n", "\r")):
+            return '"' + text.replace('"', '""') + '"'
+        return text
+
+    lines = [",".join(label for _, label in columns)]
+    lines.extend(",".join(cell(row.get(key)) for key, _ in columns) for row in rows)
+    stamp = storage.now()[:10]
+    return PlainTextResponse(
+        "\r\n".join(lines),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="pouch-operacoes-{stamp}.csv"'})
+
+
 @app.get("/api/breakdown")
 def breakdown() -> dict[str, Any]:
     return report.breakdown()
@@ -251,7 +287,7 @@ def breakdown() -> dict[str, Any]:
 def events(limit: int = 60, source: str | None = None) -> list[dict[str, Any]]:
     """Recent activity, optionally for one book only.
 
-    Three books writing into one feed makes it unreadable: what a reader wants
+    Two books writing into one feed makes it unreadable: what a reader wants
     from an activity list is what the book in front of them just did.
     """
     return storage.recent_events(limit, source)
@@ -279,6 +315,22 @@ def feeds_series(feed: str, symbol: str | None = None,
 @app.get("/api/feeds/headlines")
 def feeds_headlines(limit: int = 50) -> list[dict[str, Any]]:
     return feeds.headlines(limit)
+
+
+@app.post("/api/feeds/start")
+def feeds_start() -> dict[str, Any]:
+    return feeds.collector.start()
+
+
+@app.post("/api/feeds/stop")
+def feeds_stop() -> dict[str, Any]:
+    """Stop collecting, and remember it across restarts.
+
+    The period spent off is not recoverable: funding and fear-and-greed can be
+    backfilled, positioning and headlines cannot, so the gap is permanent. The
+    stop is logged as a warning for that reason.
+    """
+    return feeds.collector.stop()
 
 
 @app.post("/api/feeds/collect")
@@ -440,140 +492,62 @@ def bot_reset() -> dict[str, Any]:
     return {"reset": True}
 
 
-# ----------------------------------------------------------------------- lab
+# ----------------------------------------------------------------- processes
 #
-# The parallel experiment. Every route is prefixed and every table it touches is
-# its own, so nothing here can reach the live book's ledger.
+# Everything that wakes on a clock, in one place. They were each switched from
+# wherever they happened to be shown - the robot from the header, the lab from
+# its own book, collection from the research tab - which meant no screen could
+# answer "what is this process actually doing right now".
 
 
-@app.get("/api/lab/overview")
-def lab_overview() -> dict[str, Any]:
-    return lab.overview()
-
-
-@app.get("/api/lab/status")
-def lab_status() -> dict[str, Any]:
-    return lab.trader.status()
-
-
-@app.get("/api/lab/equity")
-def lab_equity(limit: int = 500) -> list[dict[str, Any]]:
-    return lab.equity_curve(limit)
-
-
-@app.get("/api/lab/trades")
-def lab_trades(limit: int = 200) -> list[dict[str, Any]]:
-    return lab.closed_positions(limit)
-
-
-@app.get("/api/lab/signals")
-def lab_signals() -> dict[str, Any]:
-    """Today's ranking. The top ``top_k`` are what the book wants to hold."""
-    return lab.score_today()
-
-
-@app.get("/api/lab/models")
-def lab_models(limit: int = 20) -> list[dict[str, Any]]:
-    return lab.models(limit)
-
-
-@app.post("/api/lab/train")
-def lab_train() -> dict[str, Any]:
-    """Kick off a retrain. Takes about a minute, so it does not block the call."""
-    return lab.train_async()
-
-
-@app.get("/api/lab/train/status")
-def lab_train_status() -> dict[str, Any]:
-    return lab.training_status()
-
-
-@app.post("/api/lab/config")
-def lab_config(patch: dict[str, Any]) -> dict[str, Any]:
-    return lab.save_config(patch)
-
-
-@app.post("/api/lab/start")
-def lab_start() -> dict[str, Any]:
-    return lab.trader.start()
-
-
-@app.post("/api/lab/stop")
-def lab_stop() -> dict[str, Any]:
-    return lab.trader.stop()
-
-
-@app.post("/api/lab/tick")
-def lab_tick(force: bool = False) -> dict[str, Any]:
-    return lab.trader.tick(force=force)
-
-
-@app.post("/api/lab/close-all")
-def lab_close_all() -> dict[str, Any]:
-    return {"closed": lab.trader.close_all("manual")}
-
-
-@app.post("/api/lab/reset")
-def lab_reset() -> dict[str, Any]:
-    """Wipe the experiment's ledger. Trained models are kept deliberately."""
-    lab.trader.stop()
-    return lab.reset()
-
-
-# -------------------------------------------------------------------- mirror
-#
-# The exit study. Reads the live ledger, writes only mirror tables. There is no
-# route here that can change a live position, and no code path either.
-
-
-@app.get("/api/mirror/overview")
-def mirror_overview() -> dict[str, Any]:
-    return mirror.overview()
-
-
-@app.get("/api/mirror/equity")
-def mirror_equity(arm: str | None = None, limit: int = 500) -> Any:
-    """One arm's curve, or every arm keyed by name when no arm is named."""
-    if arm:
-        return mirror.equity_curve(arm, limit)
-    return mirror.equity_curves(limit)
-
-
-@app.get("/api/mirror/trades")
-def mirror_trades(arm: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
-    return mirror.closed_positions(arm, limit)
-
-
-@app.get("/api/mirror/positions")
-def mirror_positions(arm: str | None = None) -> list[dict[str, Any]]:
-    return mirror.open_positions(arm)
-
-
-@app.post("/api/mirror/config")
-def mirror_config(patch: dict[str, Any]) -> dict[str, Any]:
-    return mirror.save_config(patch)
-
-
-@app.post("/api/mirror/start")
-def mirror_start() -> dict[str, Any]:
-    return mirror.trader.start()
-
-
-@app.post("/api/mirror/stop")
-def mirror_stop() -> dict[str, Any]:
-    return mirror.trader.stop()
-
-
-@app.post("/api/mirror/tick")
-def mirror_tick() -> dict[str, Any]:
-    return mirror.trader.safe_tick()
-
-
-@app.post("/api/mirror/reset")
-def mirror_reset() -> dict[str, Any]:
-    """Wipe the study and let it re-adopt from today."""
-    mirror.trader.stop()
-    return mirror.reset()
+@app.get("/api/processes")
+def processes() -> dict[str, Any]:
+    """Every background loop: whether it is running, and how often it wakes."""
+    bot_config = get_config()
+    return {"processes": [
+        {
+            "key": "bot",
+            "label": "Robô — livro validado",
+            "detail": "Lê o sinal na última vela fechada e decide entrada e saída.",
+            "running": bot.running,
+            "enabled": bool(bot_config.get("enabled")),
+            "every_seconds": int(bot_config.get("poll_seconds", 60)),
+            "start": "/api/bot/start",
+            "stop": "/api/bot/stop",
+            # The one process that refuses to start with nothing to trade, so
+            # the panel says why rather than showing a button that does nothing.
+            "blocked": ("nenhuma estratégia alocada"
+                        if not bot_config.get("allocations") else None),
+        },
+        {
+            "key": "feeds",
+            "label": "Coleta de contexto de mercado",
+            "detail": "Financiamento, posicionamento, medo e ganância, manchetes.",
+            "running": feeds.collector.running,
+            "enabled": bool(feeds.get_config().get("enabled")),
+            # The thread wakes twice a minute and does nothing on almost every
+            # wake; what matters to a reader is the fastest feed it serves.
+            "every_seconds": min(feeds.CADENCE_SECONDS.values()),
+            "start": "/api/feeds/start",
+            "stop": "/api/feeds/stop",
+            "warn_on_stop": ("Posicionamento e manchetes não podem ser recuperados"
+                             " depois: o período desligado fica faltando para sempre."),
+            "blocked": None,
+        },
+        {
+            "key": "sentiment",
+            "label": "Pontuação de manchetes (FinBERT)",
+            "detail": "Roda no relógio da coleta. ~500 MB residentes depois do"
+                      " primeiro uso — é o que aperta a máquina pequena.",
+            "running": bool(sentiment.get_config().get("enabled")) and feeds.collector.running,
+            "enabled": bool(sentiment.get_config().get("enabled")),
+            "every_seconds": feeds.CADENCE_SECONDS["headlines"],
+            "start": "/api/sentiment/start",
+            "stop": "/api/sentiment/stop",
+            "blocked": ("a coleta está desligada, então nada chega para pontuar"
+                        if not feeds.collector.running else None),
+        },
+    ]}
 
 
 # ----------------------------------------------------------------- sentiment
@@ -590,6 +564,21 @@ def sentiment_score(limit: int = 500) -> dict[str, Any]:
     return sentiment.score_pending(limit)
 
 
+@app.post("/api/sentiment/start")
+def sentiment_start() -> dict[str, Any]:
+    return sentiment.set_enabled(True)
+
+
+@app.post("/api/sentiment/stop")
+def sentiment_stop() -> dict[str, Any]:
+    """Stop scoring headlines, and stop paying the ~500 MB the model costs.
+
+    Collection is unaffected. `sentiment` goes NULL from here, which is the
+    discontinuity `sentiment_model` exists to make visible.
+    """
+    return sentiment.set_enabled(False)
+
+
 @app.post("/api/sentiment/retry")
 def sentiment_retry() -> dict[str, Any]:
     """Try loading the model again after a failed download."""
@@ -601,8 +590,7 @@ def sentiment_retry() -> dict[str, Any]:
 app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")
 
 
-@app.get("/")
-def index() -> HTMLResponse:
+def _page() -> HTMLResponse:
     """The page, with a build stamp on each asset URL.
 
     A dashboard is deployed by restarting a process, and the browser has no way
@@ -613,8 +601,35 @@ def index() -> HTMLResponse:
     which is the only version of this that cannot go stale.
     """
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-    for name in ("app.js", "style.css"):
+    for name in ("app.js", "style.css", "demo.js"):
         path = WEB_DIR / name
         stamp = int(path.stat().st_mtime) if path.exists() else 0
         html = html.replace(f"/assets/{name}", f"/assets/{name}?v={stamp}")
-    return HTMLResponse(html)
+    # The stamping above fixes stale assets and cannot fix a stale document:
+    # this URL never changes, carries no validator, and a browser is free to
+    # serve it from its own cache for as long as it likes. When it does, the
+    # page it serves still points at yesterday's stamps, so every asset is
+    # stale too and the whole mechanism above is bypassed. Small, uncached,
+    # regenerated per request - there is nothing here worth keeping.
+    return HTMLResponse(html, headers={"Cache-Control": "no-store, must-revalidate"})
+
+
+@app.get("/")
+def index() -> HTMLResponse:
+    return _page()
+
+
+@app.get("/demo")
+def demo() -> HTMLResponse:
+    """The same page, with fabricated numbers, for judging the layout.
+
+    A path rather than a button, because the button had to live in the header
+    of the real dashboard: a control whose only purpose is to make the screen
+    lie does not belong next to the account balance. On its own URL it is
+    opt-in by navigation, impossible to hit by accident, and trivially
+    removable - this route and `web/demo.js` go together.
+
+    Served by the same function, so the two can never drift apart. `demo.js`
+    reads the path and only patches `fetch` when it is this one.
+    """
+    return _page()

@@ -47,6 +47,35 @@ _load_error: str | None = None
 _load_attempted = False
 
 
+# FinBERT is ~440 MB of weights and roughly 500 MB resident once loaded, and it
+# stays until the process dies. On a 956 MB host that is the difference between
+# a responsive machine and one that pages while trying to finish a TLS
+# handshake. The switch exists so the cost can be declined without deleting the
+# feature, and it is checked before the model is ever touched - a scorer that
+# is off must not load the weights to discover that.
+#
+# Headlines keep being collected either way. What stops is the score, and the
+# gap is visible rather than silent: `sentiment` goes NULL for that stretch,
+# next to a `sentiment_model` that names what scored the rest.
+DEFAULTS: dict[str, Any] = {"enabled": True}
+
+
+def get_config() -> dict[str, Any]:
+    return {**DEFAULTS, **(storage.get_state("sentiment_config") or {})}
+
+
+def save_config(patch: dict[str, Any]) -> dict[str, Any]:
+    config = {**get_config(), **patch}
+    storage.set_state("sentiment_config", config)
+    return config
+
+
+def set_enabled(on: bool) -> dict[str, Any]:
+    config = save_config({"enabled": bool(on)})
+    storage.log_event("info", f"Pontuação de sentimento {'ligada' if on else 'desligada'}")
+    return {"enabled": config["enabled"]}
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -63,6 +92,7 @@ def status() -> dict[str, Any]:
         "SELECT COUNT(*) AS n FROM feed_headlines WHERE sentiment IS NOT NULL")["n"]
     return {
         "model": MODEL_NAME,
+        "enabled": bool(get_config().get("enabled")),
         "loaded": _pipeline is not None,
         "error": _load_error,
         "scored": scored,
@@ -136,7 +166,13 @@ def score_pending(limit: int = 500) -> dict[str, Any]:
     Called right after every headline poll, so in steady state this handles the
     handful of items that arrived in the last ten minutes. The limit exists for
     the first run after the model is installed, when a backlog is waiting.
+
+    The switch is read before anything else, because the point of turning this
+    off is to not pay for the weights - and finding out the feature is disabled
+    after loading 500 MB would defeat it.
     """
+    if not get_config().get("enabled"):
+        return {"scored": 0, "pending": 0, "model": MODEL_NAME, "disabled": True}
     rows = storage.query(
         "SELECT id, title, summary FROM feed_headlines"
         " WHERE sentiment IS NULL ORDER BY id LIMIT ?", (limit,))
