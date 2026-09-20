@@ -105,10 +105,21 @@ class TraderBot:
             storage.log_event("info", "Bot started", {"mode": config["mode"]})
             return {"running": True, "message": "started"}
 
-    def stop(self) -> dict[str, Any]:
-        save_config({"enabled": False})
+    def stop(self, remember: bool = True) -> dict[str, Any]:
+        """Stop trading.
+
+        ``remember`` is false on shutdown. The process ending is not the
+        operator deciding to stop trading, and writing that decision down on
+        every exit is how a restart came to disable the bot for good: the
+        lifespan called this on the way out, `enabled` went false, and the
+        resume on the way back in read that false and declined to start. The
+        book then sat silent until somebody noticed - and every candle close it
+        slept through counts against coverage forever.
+        """
+        if remember:
+            save_config({"enabled": False})
+            storage.log_event("info", "Bot stopped")
         self._stop.set()
-        storage.log_event("info", "Bot stopped")
         return {"running": False, "message": "stopped"}
 
     # ------------------------------------------------------------------ loop

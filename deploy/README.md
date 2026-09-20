@@ -264,9 +264,22 @@ atual.
 
 - **Não espere trocar de branch dentro de `/opt/pouch`.** Não há `.git` ali. A
   branch se troca no checkout de origem, e o `install.sh` carrega o resultado.
-- **Não faça merge em `main` se o checkout de origem segue `main`.** O forward
-  test vale porque nada mudou embaixo dele. Mantenha a máquina numa branch e
-  faça o merge quando o teste terminar.
+- **Não implante uma mudança de motor sem perceber que ela é uma.** O forward
+  test vale porque o motor não mudou embaixo dele, e essa é a única coisa que
+  precisa ser protegida — não a branch. Uma alteração que só mexe em interface,
+  relatório ou schema de tabela removida pode ir para `main` e ser implantada
+  normalmente; a paridade acumulada continua comparável.
+
+  A regra checável, rodada antes de cada implantação:
+
+  ```bash
+  git diff --stat <implantado>..HEAD -- bot/live.py bot/exchange.py       bot/strategies.py bot/backtest.py bot/research.py bot/walkforward.py       bot/parity.py bot/coverage.py bot/tracking.py bot/portfolio.py
+  ```
+
+  Saída vazia: implante à vontade. Saída com linhas: aí sim é hora de decidir
+  se o teste em andamento recomeça, e a decisão é sua — mas deliberada, em vez
+  de acidental. Uma regra do tipo "nunca faça merge" é ignorada em três semanas;
+  uma verificação de uma linha dispara no momento certo.
 - **Não chame `POST /api/coverage/baseline`** para limpar velas perdidas de uma
   janela de manutenção. Ele existe para uma mudança de hospedagem. Usá-lo porque
   o número ficou feio faz o número deixar de medir qualquer coisa.

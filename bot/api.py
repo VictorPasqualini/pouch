@@ -40,9 +40,9 @@ async def lifespan(_app: FastAPI):
     if feeds.get_config().get("enabled"):
         feeds.collector.start()
     yield
-    bot.stop()
-    # Shutdown is not the operator choosing to collect nothing, so it does not
-    # write that choice down.
+    # Shutdown is not the operator choosing to stop. Neither of these writes
+    # that choice down, so a restart resumes whatever was running before it.
+    bot.stop(remember=False)
     feeds.collector.stop(remember=False)
 
 
